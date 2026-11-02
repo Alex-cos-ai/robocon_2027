@@ -20,7 +20,7 @@ amcl:
       y: 5.15
       z: 0.0
       yaw: 0.0
-    min_particles: 500
+    min_particles: 1000
     max_particles: 3000
     pf_err: 0.05
     pf_z: 0.99
