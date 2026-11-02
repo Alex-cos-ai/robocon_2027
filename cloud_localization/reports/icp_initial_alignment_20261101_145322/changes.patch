@@ -1,0 +1,310 @@
+--- before/src/robocon_cloud_localization/src/loop_closure_pgo.cpp
++++ after/src/robocon_cloud_localization/src/loop_closure_pgo.cpp
+@@ -77,9 +77,20 @@
+     declare_parameter("localization_icp_weight", 0.10);
+     declare_parameter("localization_max_correction", 0.35);
+     declare_parameter("localization_max_rotation_correction", 0.25);
++    declare_parameter("localization_initial_max_correction", 1.0);
++    declare_parameter("localization_initial_max_rotation_correction", 0.35);
++    declare_parameter("localization_initial_fitness_max", 0.01);
++    declare_parameter("localization_initial_inlier_distance", 0.20);
++    declare_parameter("localization_initial_inlier_ratio_min", 0.60);
++    declare_parameter("localization_initial_consistent_frames", 3);
++    declare_parameter("localization_initial_consistency_translation", 0.10);
++    declare_parameter("localization_initial_consistency_rotation", 0.05);
+     declare_parameter("map_publish_rate", 1.0);
+     declare_parameter("initial_pose_x", 0.0);
+     declare_parameter("initial_pose_y", 0.0);
++    declare_parameter("initial_pose_z", 0.0);
++    declare_parameter("initial_pose_roll", 0.0);
++    declare_parameter("initial_pose_pitch", 0.0);
+     declare_parameter("initial_pose_yaw", 0.0);
+     mode_ = get_parameter("mode").as_string();
+     map_directory_ = get_parameter("map_directory").as_string();
+@@ -89,6 +100,18 @@
+     radius_ = get_parameter("scan_context_radius").as_double();
+     if (rings_ < 4 || sectors_ < 12 || radius_ <= 1.0 || (mode_ != "map" && mode_ != "localize"))
+       throw std::runtime_error("Invalid Scan Context dimensions/radius or mode");
++    for (const auto *name : {"localization_initial_max_correction",
++         "localization_initial_max_rotation_correction", "localization_initial_fitness_max",
++         "localization_initial_inlier_distance", "localization_initial_consistency_translation",
++         "localization_initial_consistency_rotation"}) {
++      const double value = get_parameter(name).as_double();
++      if (!std::isfinite(value) || value <= 0.0)
++        throw std::runtime_error(std::string(name) + " must be finite and positive");
++    }
++    const double initial_overlap = get_parameter("localization_initial_inlier_ratio_min").as_double();
++    if (!std::isfinite(initial_overlap) || initial_overlap <= 0.0 || initial_overlap > 1.0 ||
++        get_parameter("localization_initial_consistent_frames").as_int() < 1)
++      throw std::runtime_error("Invalid localization initialization overlap or frame count");
+     const auto robust = gtsam::noiseModel::Robust::Create(
+       gtsam::noiseModel::mEstimator::Huber::Create(1.5),
+       gtsam::noiseModel::Diagonal::Sigmas((gtsam::Vector(6) << .04,.04,.04,.025,.025,.035).finished()));
+@@ -102,8 +125,11 @@
+     params.relinearizeThreshold = 0.05;
+     params.relinearizeSkip = 1;
+     isam_ = std::make_unique<gtsam::ISAM2>(params);
+-    localization_offset_ = gtsam::Pose3(gtsam::Rot3::Rz(get_parameter("initial_pose_yaw").as_double()),
+-      gtsam::Point3(get_parameter("initial_pose_x").as_double(),get_parameter("initial_pose_y").as_double(),0));
++    localization_offset_ = gtsam::Pose3(gtsam::Rot3::RzRyRx(
++      get_parameter("initial_pose_roll").as_double(), get_parameter("initial_pose_pitch").as_double(),
++      get_parameter("initial_pose_yaw").as_double()), gtsam::Point3(
++      get_parameter("initial_pose_x").as_double(), get_parameter("initial_pose_y").as_double(),
++      get_parameter("initial_pose_z").as_double()));
+     cloud_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
+       "/livox/lidar", rclcpp::SensorDataQoS(),
+       std::bind(&LoopClosurePGO::cloudCallback, this, std::placeholders::_1));
+@@ -301,18 +327,25 @@
+     localization_wheel_previous_=latest_wheel_;
+     const auto lidar_motion=lidar_in_base.inverse().compose(base_motion).compose(lidar_in_base);
+     const auto predicted=optimized_localization_.compose(lidar_motion);
++    const bool initializing = !localization_aligned_;
++    const char *stage = initializing ? "initializing" : "tracking";
+ 
+     pcl::GeneralizedIterativeClosestPoint<pcl::PointXYZI,pcl::PointXYZI> gicp;
+     gicp.setMaximumIterations(35); gicp.setMaxCorrespondenceDistance(.65);
+     gicp.setInputSource(cloud); gicp.setInputTarget(map_cloud_);
+     Eigen::Matrix4f guess=predicted.matrix().cast<float>();
+     Cloud aligned; gicp.align(aligned,guess);
+-    const double fitness=gicp.getFitnessScore(.65);
+-    const double fitness_limit=get_parameter("localization_fitness_max").as_double();
+-    if(!gicp.hasConverged()||fitness>fitness_limit) {
++    // PCL averages squared nearest-neighbor distances and expects a squared
++    // cutoff here, unlike setMaxCorrespondenceDistance (which takes metres).
++    const double fitness=gicp.getFitnessScore(.65 * .65);
++    const double fitness_limit=get_parameter(initializing ?
++      "localization_initial_fitness_max" : "localization_fitness_max").as_double();
++    if(!gicp.hasConverged() || !gicp.getFinalTransformation().allFinite() ||
++       !std::isfinite(fitness) || fitness>fitness_limit) {
++      localization_initial_matches_ = 0;
+       RCLCPP_INFO_THROTTLE(get_logger(),*get_clock(),2000,
+-        "GICP localization rejected: converged=%s fitness=%.3fm threshold=%.3fm source=%zu map=%zu; using wheel prediction",
+-        gicp.hasConverged()?"true":"false",fitness,fitness_limit,cloud->size(),map_cloud_->size());
++        "GICP %s rejected: converged=%s fitness=%.5f m^2 limit=%.5f m^2 source=%zu map=%zu; using wheel prediction",
++        stage,gicp.hasConverged()?"true":"false",fitness,fitness_limit,cloud->size(),map_cloud_->size());
+       optimized_localization_=predicted;
+       publishLocalizationPose(stamp,1.0);
+       return;
+@@ -321,13 +354,86 @@
+     const gtsam::Vector6 correction=predicted.localCoordinates(icp_pose);
+     const double rotation_error=correction.head<3>().norm();
+     const double translation_error=correction.tail<3>().norm();
+-    if(translation_error>get_parameter("localization_max_correction").as_double()||
+-       rotation_error>get_parameter("localization_max_rotation_correction").as_double()) {
++    const double translation_limit = get_parameter(initializing ?
++      "localization_initial_max_correction" : "localization_max_correction").as_double();
++    const double rotation_limit = get_parameter(initializing ?
++      "localization_initial_max_rotation_correction" : "localization_max_rotation_correction").as_double();
++    // Direct translation differences are in MAP axes; the SE(3) logarithm
++    // above is in the predicted sensor frame and is not an XYZ map offset.
++    const Eigen::Vector3d map_delta = icp_pose.translation() - predicted.translation();
++    const Eigen::Vector3d rotation_delta = predicted.between(icp_pose).rotation().rpy() * (180.0 / M_PI);
++    RCLCPP_INFO_THROTTLE(get_logger(),*get_clock(),2000,
++      "GICP %s candidate: fitness=%.5f m^2 map_delta_xyz=[%.3f %.3f %.3f] m "
++      "relative_delta_rpy=[%.2f %.2f %.2f] deg; translation=%.3f/%.3f m rotation=%.3f/%.3f rad",
++      stage,fitness,map_delta.x(),map_delta.y(),map_delta.z(),
++      rotation_delta.x(),rotation_delta.y(),rotation_delta.z(),
++      translation_error,translation_limit,rotation_error,rotation_limit);
++    if(translation_error>translation_limit || rotation_error>rotation_limit) {
++      localization_initial_matches_ = 0;
+       RCLCPP_INFO_THROTTLE(get_logger(),*get_clock(),2000,
+-        "GICP localization correction rejected: fitness=%.3fm delta=%.3fm rotation=%.3frad; using wheel prediction",
+-        fitness,translation_error,rotation_error);
++        "GICP %s correction rejected: exceeds correction limits; using wheel prediction", stage);
+       optimized_localization_=predicted;
+       publishLocalizationPose(stamp,1.0);
++      return;
++    }
++    if (initializing) {
++      // Low fitness alone can come from a small patch of floor. Require a
++      // substantial fraction of the WHOLE scan to agree with the target.
++      pcl::search::KdTree<pcl::PointXYZI> tree;
++      tree.setInputCloud(map_cloud_);
++      size_t inliers = 0;
++      std::vector<int> ids(1);
++      std::vector<float> distances(1);
++      const double distance = get_parameter("localization_initial_inlier_distance").as_double();
++      for (const auto &point : aligned.points) {
++        if (std::isfinite(point.x) && std::isfinite(point.y) && std::isfinite(point.z) &&
++            tree.nearestKSearch(point, 1, ids, distances) > 0 && distances[0] <= distance * distance)
++          ++inliers;
++      }
++      const double overlap = aligned.empty() ? 0.0 : double(inliers) / aligned.size();
++      if (overlap < get_parameter("localization_initial_inlier_ratio_min").as_double()) {
++        localization_initial_matches_ = 0;
++        RCLCPP_INFO_THROTTLE(get_logger(),*get_clock(),2000,
++          "GICP initialization rejected: overlap=%.1f%% below %.1f%% within %.2f m; using wheel prediction",
++          overlap * 100.0, get_parameter("localization_initial_inlier_ratio_min").as_double() * 100.0,
++          distance);
++        optimized_localization_ = predicted;
++        publishLocalizationPose(stamp, 1.0);
++        return;
++      }
++      bool consistent = false;
++      if (localization_initial_matches_ > 0) {
++        // Compare candidates after compensating robot motion between scans.
++        const auto previous = localization_initial_candidate_.compose(lidar_motion);
++        const auto change = previous.between(icp_pose);
++        consistent = change.translation().norm() <=
++          get_parameter("localization_initial_consistency_translation").as_double() &&
++          gtsam::Rot3::Logmap(change.rotation()).norm() <=
++          get_parameter("localization_initial_consistency_rotation").as_double();
++      }
++      localization_initial_matches_ = consistent ? localization_initial_matches_ + 1 : 1;
++      localization_initial_candidate_ = icp_pose;
++      const int required = get_parameter("localization_initial_consistent_frames").as_int();
++      if (localization_initial_matches_ < required) {
++        RCLCPP_INFO_THROTTLE(get_logger(),*get_clock(),2000,
++          "GICP initialization pending: %d/%d consistent scans, overlap=%.1f%%",
++          localization_initial_matches_,required,overlap*100.0);
++        optimized_localization_ = predicted;
++        publishLocalizationPose(stamp, 1.0);
++        return;
++      }
++      // Apply the full validated initial alignment ONCE. Blending only 10%%
++      // here would leave an initial offset above the tracking correction gate.
++      optimized_localization_ = icp_pose;
++      localization_aligned_ = true;
++      const auto rpy = icp_pose.rotation().rpy();
++      RCLCPP_INFO(get_logger(),
++        "GICP initialized: map_pose_xyz=[%.4f %.4f %.4f] m rpy=[%.6f %.6f %.6f] rad "
++        "fitness=%.5f m^2 overlap=%.1f%%; tracking limits now %.2f m / %.2f rad",
++        icp_pose.x(),icp_pose.y(),icp_pose.z(),rpy.x(),rpy.y(),rpy.z(),fitness,overlap*100.0,
++        get_parameter("localization_max_correction").as_double(),
++        get_parameter("localization_max_rotation_correction").as_double());
++      publishLocalizationPose(stamp, fitness);
+       return;
+     }
+     const double icp_weight=std::clamp(get_parameter("localization_icp_weight").as_double(),0.0,1.0);
+@@ -455,6 +561,9 @@
+   std::string mode_,map_directory_,map_file_;int rings_=20,sectors_=60;double radius_=18;
+   std::mutex mutex_;bool have_lio_pose_=false,have_wheel_pose_=false,have_wheel_anchor_=false,have_lio_anchor_=false,last_keyframe_=false;size_t loop_count_=0;
+   gtsam::Pose3 latest_lio_,latest_wheel_,lio_anchor_,wheel_anchor_,localization_wheel_previous_,optimized_localization_,localization_offset_;bool localization_started_=false;builtin_interfaces::msg::Time latest_stamp_;
++  bool localization_aligned_ = false;
++  int localization_initial_matches_ = 0;
++  gtsam::Pose3 localization_initial_candidate_;
+   std::vector<Keyframe> keyframes_;Cloud::Ptr map_cloud_{new Cloud};
+   gtsam::NonlinearFactorGraph graph_;gtsam::Values initials_,optimized_;
+   std::unique_ptr<gtsam::ISAM2> isam_;gtsam::SharedNoiseModel loop_noise_,wheel_noise_,lio_noise_,prior_noise_;
+--- before/src/robocon_cloud_localization/config/localization.yaml
++++ after/src/robocon_cloud_localization/config/localization.yaml
+@@ -17,8 +17,18 @@
+     gicp_max_correspondence: 0.8
+     loop_fitness_max: 0.10
+     loop_inlier_ratio_min: 0.35
+-    localization_fitness_max: 0.35
++    localization_fitness_max: 0.35  # PCL mean squared distance, m^2
+     localization_icp_weight: 0.10
+     localization_max_correction: 0.35
+     localization_max_rotation_correction: 0.25
++    # Startup: accept a larger correction only after good scan overlap and
++    # consecutive candidates agree. Once aligned, use the strict gates above.
++    localization_initial_max_correction: 1.0  # m
++    localization_initial_max_rotation_correction: 0.35  # rad
++    localization_initial_fitness_max: 0.01  # m^2 (0.10 m RMSE)
++    localization_initial_inlier_distance: 0.20  # m
++    localization_initial_inlier_ratio_min: 0.60
++    localization_initial_consistent_frames: 3
++    localization_initial_consistency_translation: 0.10  # m between candidates
++    localization_initial_consistency_rotation: 0.05  # rad between candidates
+     map_publish_rate: 1.0
+--- before/src/robocon_cloud_localization/launch/localization.launch.py
++++ after/src/robocon_cloud_localization/launch/localization.launch.py
+@@ -21,6 +21,9 @@
+         #icp initial pose -----------覆盖simulation
+         DeclareLaunchArgument('initial_pose_x', default_value='-2.63', description='Initial lidar x estimate in the FAST-LIO map frame'),
+         DeclareLaunchArgument('initial_pose_y', default_value='-2.63', description='Initial lidar y estimate in the FAST-LIO map frame'),
++        DeclareLaunchArgument('initial_pose_z', default_value='0.0', description='Initial lidar z in the PCD map, metres'),
++        DeclareLaunchArgument('initial_pose_roll', default_value='0.0', description='Initial lidar roll in the PCD map, radians'),
++        DeclareLaunchArgument('initial_pose_pitch', default_value='0.0', description='Initial lidar pitch in the PCD map, radians'),
+         DeclareLaunchArgument('initial_pose_yaw', default_value='0.0', description='Initial map-frame yaw estimate'),
+         
+         DeclareLaunchArgument('world_to_map_x', default_value='-5.15', description='Map origin x in Gazebo world coordinates'),
+@@ -39,6 +42,9 @@
+                 'map_file': LaunchConfiguration('map_file'),
+                 'initial_pose_x': LaunchConfiguration('initial_pose_x'), #icp初始位置
+                 'initial_pose_y': LaunchConfiguration('initial_pose_y'),
++                'initial_pose_z': LaunchConfiguration('initial_pose_z'),
++                'initial_pose_roll': LaunchConfiguration('initial_pose_roll'),
++                'initial_pose_pitch': LaunchConfiguration('initial_pose_pitch'),
+                 'initial_pose_yaw': LaunchConfiguration('initial_pose_yaw'),
+                 'world_to_map_x': LaunchConfiguration('world_to_map_x'),
+                 'world_to_map_y': LaunchConfiguration('world_to_map_y'),
+--- before/src/robocon_cloud_localization/launch/simulation.launch.py
++++ after/src/robocon_cloud_localization/launch/simulation.launch.py
+@@ -60,6 +60,9 @@
+     map_file = LaunchConfiguration("map_file")
+     guess_x = LaunchConfiguration("initial_pose_x")
+     guess_y = LaunchConfiguration("initial_pose_y")
++    guess_z = LaunchConfiguration("initial_pose_z")
++    guess_roll = LaunchConfiguration("initial_pose_roll")
++    guess_pitch = LaunchConfiguration("initial_pose_pitch")
+     guess_yaw = LaunchConfiguration("initial_pose_yaw")
+     world_to_map_x = LaunchConfiguration("world_to_map_x")
+     world_to_map_y = LaunchConfiguration("world_to_map_y")
+@@ -183,6 +186,9 @@
+                     "map_file": map_file,
+                     "initial_pose_x": ParameterValue(guess_x, value_type=float),
+                     "initial_pose_y": ParameterValue(guess_y, value_type=float),
++                    "initial_pose_z": ParameterValue(guess_z, value_type=float),
++                    "initial_pose_roll": ParameterValue(guess_roll, value_type=float),
++                    "initial_pose_pitch": ParameterValue(guess_pitch, value_type=float),
+                     "initial_pose_yaw": ParameterValue(guess_yaw, value_type=float),
+                 },
+             ],
+@@ -263,6 +269,18 @@
+                 "initial_pose_y",
+                 default_value="-5.15",
+                 description="initial map-frame y guess for ICP relocalization",
++            ),
++            DeclareLaunchArgument(
++                "initial_pose_z", default_value="0.0",
++                description="initial lidar z in the PCD map, metres",
++            ),
++            DeclareLaunchArgument(
++                "initial_pose_roll", default_value="0.0",
++                description="initial lidar roll in the PCD map, radians",
++            ),
++            DeclareLaunchArgument(
++                "initial_pose_pitch", default_value="0.0",
++                description="initial lidar pitch in the PCD map, radians",
+             ),
+             DeclareLaunchArgument(
+                 "initial_pose_yaw",
+--- before/README.md
++++ after/README.md
+@@ -80,13 +80,32 @@
+ Use `/save_map` (or `./scripts/save_map.sh`) for the separate optimized
+ pose-graph map in `maps/fastlio_mid360_downward/map.pcd`.
+ 
+-## Relocalize against `laser_map.pcd`
++## Relocalize against a saved PCD
+ 
+ ```bash
+ ros2 launch robocon_cloud_localization localization.launch.py
+ ```
+ 
+-The `localization.launch.py` entry point starts the shared simulation in `mode:=localize` and loads `src/robocon_cloud_localization/maps/laser_map.pcd` (installed into the package share directory at build time). With no launch arguments, the robot spawns at `(-5.15, 5.15)` in Gazebo world coordinates and the initial map-frame pose guess is `(-5.15, 5.15, 0)`. The launch also publishes a configurable static `world -> map` calibration TF; its defaults are identity and must be replaced with a measured field-to-PCD transform. The map-frame guess is independent from the Gazebo spawn coordinates and must be close enough for local GICP convergence. The 2.58-million-point target is voxel-filtered to 0.10 m before registration. GICP results must pass the fitness and continuity gates before correcting wheel odometry. The relocalizer publishes its pose on `/localization/pose` and TF `map -> lidar_init`.
++The `localization.launch.py` entry point starts the shared simulation in `mode:=localize`. Choose the target with `map_file:=/absolute/path/to/map.pcd`; check the effective defaults with `ros2 launch robocon_cloud_localization localization.launch.py --show-args`. FAST-LIO's automatic PCD saving is disabled during localization so the target cannot be overwritten on shutdown.
++
++`initial_x`, `initial_y` and `initial_yaw` set the Gazebo spawn. `initial_pose_x/y/z` and `initial_pose_roll/pitch/yaw` set the initial **lidar** pose in the PCD map, in metres and radians. These are independent coordinate systems. A FAST-LIO map is anchored near the original mapping start, so world coordinates cannot simply be copied into the initial map pose. Set these arguments in the outer `localization.launch.py` or on the command line; values passed by that launch override defaults in `simulation.launch.py`. Restart the launch after editing them.
++
++Localization now has two stages, configured in `src/robocon_cloud_localization/config/localization.yaml`:
++
++- Initialization allows up to 1.0 m / 0.35 rad correction. It requires fitness <= 0.01 m^2, at least 60% of all scan points within 0.20 m of the target, and 3 consecutive candidates agreeing within 0.10 m / 0.05 rad after wheel-motion compensation. The validated initial alignment is applied in full once.
++- Tracking restores the 0.35 m / 0.25 rad correction limits and blends accepted GICP corrections using `localization_icp_weight`. Failure during tracking keeps wheel prediction; it does not automatically enable the wider initialization limits again.
++
++`GICP initializing/tracking candidate` logs include `map_delta_xyz` in **map axes**, relative rotation in degrees, and the active correction limits. `GICP initialized` prints the accepted full map pose, with rotation in **radians**, for reuse as an initial guess. PCL fitness is mean squared nearest-neighbor distance (m^2), not metres. A low score alone does not guarantee the correct field location on repetitive geometry; the initial guess must still be near the intended location.
++
++For example, to supply an initial height offset without changing your other launch defaults:
++
++```bash
++ros2 launch robocon_cloud_localization localization.launch.py initial_pose_z:=0.615
++```
++
++In the simulation check recorded under `reports/icp_initial_alignment_20261101_145322`, the configured `mid360_sim_2.pcd` required approximately `[-0.095, +0.071, +0.615]` m relative to the existing initial guess. The previous 0.35 m tracking gate rejected that height correction indefinitely. With the separate initialization gate, all scan points were within 0.20 m of the map and nearest-neighbor RMSE was about 0.04 m before and after a short forward drive. This is a local registration check, not a global map calibration.
++
++The relocalizer publishes `/localization/pose`, `map -> odom` and `map -> lidar_init`. The launch also publishes configurable static `world -> map` calibration; replace it with the measured field-to-PCD transform if Gazebo world geometry must align with the PCD.
+ 
+ After measuring the calibration transform, pass its translation in metres and roll/pitch/yaw in radians, for example:
+ 

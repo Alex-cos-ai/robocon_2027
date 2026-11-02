@@ -1,0 +1,34 @@
+# ROS 2 / colcon build products
+build/
+install/
+log/
+logs/
+gtsam-build/
+
+# Local caches and editor state
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Runtime recordings and temporary output
+*.log
+*.pcd.tmp
+*.bag
+*.db3
+rosbag2_*/
+
+# Duplicate archive of the source tree
+/Robocon2027.zip
+
+# Generated TF inspection diagrams
+cloud_localization/frames_*.gv
+cloud_localization/frames_*.pdf

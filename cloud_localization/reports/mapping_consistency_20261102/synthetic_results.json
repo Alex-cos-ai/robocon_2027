@@ -1,0 +1,23 @@
+[
+  {
+    "case": "odometry_only",
+    "endpoint_m": 0.3939543120718441,
+    "map_rmse_m": 0.14853277923597574,
+    "loops": 0,
+    "local_factors": 0
+  },
+  {
+    "case": "loop_only",
+    "endpoint_m": 0.06384080521255277,
+    "map_rmse_m": 0.041021228375432504,
+    "loops": 3,
+    "local_factors": 0
+  },
+  {
+    "case": "local_and_loop",
+    "endpoint_m": 0.008264427331680264,
+    "map_rmse_m": 0.01580249507905665,
+    "loops": 3,
+    "local_factors": 20
+  }
+]

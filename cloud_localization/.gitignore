@@ -1,0 +1,13 @@
+build/
+install/
+log/
+__pycache__/
+*.pyc
+.pytest_cache/
+reports/*.log
+maps/*.pcd.tmp
+vendor/gtsam-build/
+vendor/install/
+maps/fastlio_mid360/
+maps/fastlio_mid360_downward/
+maps/fastlio_mid360_before_half_scale/

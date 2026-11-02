@@ -1,0 +1,67 @@
+<?xml version="1.0"?>
+<sdf version="1.6">
+  <model name="robocon_tops">
+    <static>true</static>
+    <!-- 5 x 5 public-zone layout; the centre cell is intentionally empty. -->
+    <link name="block_01"><pose>-4.65 0.40 0.102 0 0 0</pose>
+      <visual name="red_half"><pose>0.05 0 0</pose><geometry><box><size>0.1 0.2 0.2</size></box></geometry><material><ambient>0.875 0.133 0.133 1</ambient><diffuse>0.875 0.133 0.133 1</diffuse></material></visual>
+      <visual name="blue_half"><pose>-0.05 0 0</pose><geometry><box><size>0.1 0.2 0.2</size></box></geometry><material><ambient>0.196 0 1 1</ambient><diffuse>0.196 0 1 1</diffuse></material></visual>
+      <collision name="collision"><geometry><box><size>0.2 0.2 0.2</size></box></geometry></collision>
+    </link>
+    <link name="block_02"><pose>-4.25 0.40 0.102 0 0 0</pose>
+      <visual name="blue_half"><pose>0.05 0 0</pose><geometry><box><size>0.1 0.2 0.2</size></box></geometry><material><ambient>0.196 0 1 1</ambient><diffuse>0.196 0 1 1</diffuse></material></visual>
+      <visual name="red_half"><pose>-0.05 0 0</pose><geometry><box><size>0.1 0.2 0.2</size></box></geometry><material><ambient>0.875 0.133 0.133 1</ambient><diffuse>0.875 0.133 0.133 1</diffuse></material></visual>
+      <collision name="collision"><geometry><box><size>0.2 0.2 0.2</size></box></geometry></collision>
+    </link>
+    <link name="block_03"><pose>-3.85 0.40 0.102 0 0 0</pose>
+      <visual name="red_half"><pose>0.05 0 0</pose><geometry><box><size>0.1 0.2 0.2</size></box></geometry><material><ambient>0.875 0.133 0.133 1</ambient><diffuse>0.875 0.133 0.133 1</diffuse></material></visual>
+      <visual name="blue_half"><pose>-0.05 0 0</pose><geometry><box><size>0.1 0.2 0.2</size></box></geometry><material><ambient>0.196 0 1 1</ambient><diffuse>0.196 0 1 1</diffuse></material></visual>
+      <collision name="collision"><geometry><box><size>0.2 0.2 0.2</size></box></geometry></collision>
+    </link>
+    <link name="block_04"><pose>-4.45 0.20 0.102 0 0 0</pose>
+      <visual name="red_half"><pose>0 0.05 0</pose><geometry><box><size>0.2 0.1 0.2</size></box></geometry><material><ambient>0.875 0.133 0.133 1</ambient><diffuse>0.875 0.133 0.133 1</diffuse></material></visual>
+      <visual name="blue_half"><pose>0 -0.05 0</pose><geometry><box><size>0.2 0.1 0.2</size></box></geometry><material><ambient>0.196 0 1 1</ambient><diffuse>0.196 0 1 1</diffuse></material></visual>
+      <collision name="collision"><geometry><box><size>0.2 0.2 0.2</size></box></geometry></collision>
+    </link>
+    <link name="block_05"><pose>-4.05 0.20 0.102 0 0 0</pose>
+      <visual name="blue_half"><pose>0 0.05 0</pose><geometry><box><size>0.2 0.1 0.2</size></box></geometry><material><ambient>0.196 0 1 1</ambient><diffuse>0.196 0 1 1</diffuse></material></visual>
+      <visual name="red_half"><pose>0 -0.05 0</pose><geometry><box><size>0.2 0.1 0.2</size></box></geometry><material><ambient>0.875 0.133 0.133 1</ambient><diffuse>0.875 0.133 0.133 1</diffuse></material></visual>
+      <collision name="collision"><geometry><box><size>0.2 0.2 0.2</size></box></geometry></collision>
+    </link>
+    <link name="block_06"><pose>-4.65 0.00 0.102 0 0 0</pose>
+      <visual name="blue_half"><pose>0.05 0 0</pose><geometry><box><size>0.1 0.2 0.2</size></box></geometry><material><ambient>0.196 0 1 1</ambient><diffuse>0.196 0 1 1</diffuse></material></visual>
+      <visual name="red_half"><pose>-0.05 0 0</pose><geometry><box><size>0.1 0.2 0.2</size></box></geometry><material><ambient>0.875 0.133 0.133 1</ambient><diffuse>0.875 0.133 0.133 1</diffuse></material></visual>
+      <collision name="collision"><geometry><box><size>0.2 0.2 0.2</size></box></geometry></collision>
+    </link>
+    <link name="block_07"><pose>-3.85 0.00 0.102 0 0 0</pose>
+      <visual name="red_half"><pose>0.05 0 0</pose><geometry><box><size>0.1 0.2 0.2</size></box></geometry><material><ambient>0.875 0.133 0.133 1</ambient><diffuse>0.875 0.133 0.133 1</diffuse></material></visual>
+      <visual name="blue_half"><pose>-0.05 0 0</pose><geometry><box><size>0.1 0.2 0.2</size></box></geometry><material><ambient>0.196 0 1 1</ambient><diffuse>0.196 0 1 1</diffuse></material></visual>
+      <collision name="collision"><geometry><box><size>0.2 0.2 0.2</size></box></geometry></collision>
+    </link>
+    <link name="block_08"><pose>-4.45 -0.20 0.102 0 0 0</pose>
+      <visual name="blue_half"><pose>0 0.05 0</pose><geometry><box><size>0.2 0.1 0.2</size></box></geometry><material><ambient>0.196 0 1 1</ambient><diffuse>0.196 0 1 1</diffuse></material></visual>
+      <visual name="red_half"><pose>0 -0.05 0</pose><geometry><box><size>0.2 0.1 0.2</size></box></geometry><material><ambient>0.875 0.133 0.133 1</ambient><diffuse>0.875 0.133 0.133 1</diffuse></material></visual>
+      <collision name="collision"><geometry><box><size>0.2 0.2 0.2</size></box></geometry></collision>
+    </link>
+    <link name="block_09"><pose>-4.05 -0.20 0.102 0 0 0</pose>
+      <visual name="red_half"><pose>0 0.05 0</pose><geometry><box><size>0.2 0.1 0.2</size></box></geometry><material><ambient>0.875 0.133 0.133 1</ambient><diffuse>0.875 0.133 0.133 1</diffuse></material></visual>
+      <visual name="blue_half"><pose>0 -0.05 0</pose><geometry><box><size>0.2 0.1 0.2</size></box></geometry><material><ambient>0.196 0 1 1</ambient><diffuse>0.196 0 1 1</diffuse></material></visual>
+      <collision name="collision"><geometry><box><size>0.2 0.2 0.2</size></box></geometry></collision>
+    </link>
+    <link name="block_10"><pose>-4.65 -0.40 0.102 0 0 0</pose>
+      <visual name="blue_half"><pose>0.05 0 0</pose><geometry><box><size>0.1 0.2 0.2</size></box></geometry><material><ambient>0.196 0 1 1</ambient><diffuse>0.196 0 1 1</diffuse></material></visual>
+      <visual name="red_half"><pose>-0.05 0 0</pose><geometry><box><size>0.1 0.2 0.2</size></box></geometry><material><ambient>0.875 0.133 0.133 1</ambient><diffuse>0.875 0.133 0.133 1</diffuse></material></visual>
+      <collision name="collision"><geometry><box><size>0.2 0.2 0.2</size></box></geometry></collision>
+    </link>
+    <link name="block_11"><pose>-4.25 -0.40 0.102 0 0 0</pose>
+      <visual name="red_half"><pose>0.05 0 0</pose><geometry><box><size>0.1 0.2 0.2</size></box></geometry><material><ambient>0.875 0.133 0.133 1</ambient><diffuse>0.875 0.133 0.133 1</diffuse></material></visual>
+      <visual name="blue_half"><pose>-0.05 0 0</pose><geometry><box><size>0.1 0.2 0.2</size></box></geometry><material><ambient>0.196 0 1 1</ambient><diffuse>0.196 0 1 1</diffuse></material></visual>
+      <collision name="collision"><geometry><box><size>0.2 0.2 0.2</size></box></geometry></collision>
+    </link>
+    <link name="block_12"><pose>-3.85 -0.40 0.102 0 0 0</pose>
+      <visual name="blue_half"><pose>0.05 0 0</pose><geometry><box><size>0.1 0.2 0.2</size></box></geometry><material><ambient>0.196 0 1 1</ambient><diffuse>0.196 0 1 1</diffuse></material></visual>
+      <visual name="red_half"><pose>-0.05 0 0</pose><geometry><box><size>0.1 0.2 0.2</size></box></geometry><material><ambient>0.875 0.133 0.133 1</ambient><diffuse>0.875 0.133 0.133 1</diffuse></material></visual>
+      <collision name="collision"><geometry><box><size>0.2 0.2 0.2</size></box></geometry></collision>
+    </link>
+  </model>
+</sdf>

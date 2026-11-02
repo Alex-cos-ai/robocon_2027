@@ -1,0 +1,89 @@
+Arguments (pass arguments as '<name>:=<value>'):
+
+    'gui':
+        Show Gazebo and RViz
+        (default: 'true')
+
+    'save_fastlio_pcd':
+        Save raw frontend PCD independently of optimized /save_map. Valid choices are: ['true', 'false']
+        (default: 'true')
+
+    'world':
+        Gazebo world to map
+        (default: '/home/alice/rc_2027/cloud_localization/install/robocon_cloud_localization/share/robocon_cloud_localization/worlds/robocon_track.world')
+
+    'initial_x':
+        Robot start x in field coordinates
+        (default: '-2.5')
+
+    'initial_y':
+        Robot start y in field coordinates
+        (default: '2.5')
+
+    'initial_yaw':
+        Robot start heading in radians
+        (default: '0.0')
+
+    'mode':
+        map or localize
+        (default: 'map')
+
+    'map_directory':
+        Output bundle directory for /save_map (optimized map)
+        (default: '/home/alice/rc_2027/cloud_localization/maps/fastlio_mid360_downward')
+
+    'relocalization_backend':
+        Global recovery backend (shared GICP refinement). Valid choices are: ['grid_gicp', 'bbs_cpu_gicp', 'bbs_gpu_gicp']
+        (default: 'bbs_gpu_gicp')
+
+    'map_file':
+        PCD target used by GICP when mode is localize
+        (default: '/home/alice/rc_2027/cloud_localization/install/robocon_cloud_localization/share/robocon_cloud_localization/maps/laser_map.pcd')
+
+    'initial_pose_x':
+        initial map-frame x guess for ICP relocalization
+        (default: '5.15')
+
+    'initial_pose_y':
+        initial map-frame y guess for ICP relocalization
+        (default: '-5.15')
+
+    'initial_pose_z':
+        initial lidar z in the PCD map, metres
+        (default: '0.0')
+
+    'initial_pose_roll':
+        initial lidar roll in the PCD map, radians
+        (default: '0.0')
+
+    'initial_pose_pitch':
+        initial lidar pitch in the PCD map, radians
+        (default: '0.0')
+
+    'initial_pose_yaw':
+        initial map-frame yaw guess for ICP relocalization
+        (default: '0.0')
+
+    'world_to_map_x':
+        calibrated translation x from Gazebo world to PCD map
+        (default: '0.0')
+
+    'world_to_map_y':
+        calibrated translation y from Gazebo world to PCD map
+        (default: '0.0')
+
+    'world_to_map_z':
+        calibrated translation z from Gazebo world to PCD map
+        (default: '0.0')
+
+    'world_to_map_roll':
+        calibrated roll from Gazebo world to PCD map, radians
+        (default: '0.0')
+
+    'world_to_map_pitch':
+        calibrated pitch from Gazebo world to PCD map, radians
+        (default: '0.0')
+
+    'world_to_map_yaw':
+        calibrated yaw from Gazebo world to PCD map, radians
+        (default: '0.0')

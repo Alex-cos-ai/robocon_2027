@@ -1,0 +1,46 @@
+/**:
+  ros__parameters:
+    feature_extract_enable: false
+    point_filter_num: 1
+    max_iteration: 6
+    filter_size_surf: 0.05
+    filter_size_map: 0.03
+    cube_side_length: 24.0
+    runtime_pos_log_enable: false
+    map_file_path: ""
+    common:
+      lid_topic: /livox/lidar
+      imu_topic: /livox/imu
+      pointcloud2: true
+      time_sync_en: false
+      time_offset_lidar_to_imu: 0.0
+    preprocess:
+      # Gazebo's ray sensor publishes standard x/y/z/intensity PointCloud2.
+      # Gazebo's ray sensor publishes standard x/y/z/intensity PointCloud2.
+      lidar_type: 0
+      scan_line: 32
+      blind: 0.10
+      timestamp_unit: 3
+      scan_rate: 10
+    mapping:
+      acc_cov: 0.15
+      gyr_cov: 0.20
+      b_acc_cov: 0.0001
+      b_gyr_cov: 0.0001
+      fov_degree: 360.0
+      det_range: 70.0
+      # Simulated lidar and IMU share the mid360_link origin and axes. The
+      # physical mount relative to base_link is represented by the virtual TF.
+      extrinsic_est_en: false
+      extrinsic_T: [0.0, 0.0, 0.0]
+      extrinsic_R: [1., 0., 0., 0., 1., 0., 0., 0., 1.]
+    publish:
+      path_en: true
+      effect_map_en: false
+      map_en: false
+      scan_publish_en: true
+      dense_publish_en: true
+      scan_bodyframe_pub_en: true
+    pcd_save:
+      pcd_save_en: false
+      interval: -1

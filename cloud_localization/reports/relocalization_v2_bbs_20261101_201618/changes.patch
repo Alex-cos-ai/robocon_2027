@@ -1,0 +1,854 @@
+--- a/README.md
++++ b/README.md
+@@ -95,7 +95,9 @@
+ - Initialization allows up to 1.0 m / 0.35 rad correction. It requires fitness <= 0.01 m^2, at least 60% of all scan points within 0.20 m of the target, and 3 consecutive candidates agreeing within 0.10 m / 0.05 rad after wheel-motion compensation. The validated initial alignment is applied in full once.
+ - Tracking restores the 0.35 m / 0.25 rad correction limits and blends accepted GICP corrections using `localization_icp_weight`. Rejected scans keep wheel prediction. After `localization_global_failure_frames` consecutive failures (default 10), tracking is marked lost and global recovery starts.
+ 
+-If a starting guess is several metres or a large yaw angle away, local GICP has no way to search the rest of the map. Global recovery now searches XYZ across map bounds (with a 1 m margin) and yaw over a full circle in a background worker. A coarse 3D distance grid ranks candidates, GICP refines distinct candidates, and full-scan overlap and mean squared distance filter the results. Distinct poses with similarly good scores are rejected as ambiguous. A successful candidate is compensated for wheel motion during the search and must still pass the normal three-scan initialization check. Repeated failures retry after `localization_global_retry_seconds` (default 5 s). Grid work is bounded; large maps automatically use a coarser XY search, and grids above four million cells require increasing `localization_global_voxel`.
++If a starting guess is several metres or a large yaw angle away, local GICP has no way to search the rest of the map. Global recovery searches XYZ across map bounds (with a 1 m margin) and yaw over a full circle in a background worker. Choose `relocalization_backend:=grid_gicp` for the preserved V1 distance-grid search, `bbs_cpu_gicp` for official 3D-BBS on CPU, or `bbs_gpu_gicp` for official CUDA BnB (the new launch default). All three share GICP refinement, full-scan overlap/error validation, ambiguity rejection, wheel-motion compensation and three fresh scans of confirmation. Repeated failures retry after `localization_global_retry_seconds` (default 5 s). BBS caches sparse multiresolution voxel maps and reports setup, search and refinement times separately. V1 retains its bounded grid search and automatic XY step adjustment.
++
++See [重定位算法切换与 C++ 接口](docs/relocalization_backends.md) for launch commands, parameter precedence, the common API, build instructions and an offline comparison executable.
+ 
+ The `localization_global_*` parameters are in `config/localization.yaml`. The default search is intended for this small field, assumes the gravity/mount roll and pitch are approximately known, and does not guarantee recovery in repetitive or featureless geometry. It uses the PCD, live scan and wheel motion, not Gazebo ground truth. Trigger a new search manually with:
+ 
+--- a/src/robocon_cloud_localization/CMakeLists.txt
++++ b/src/robocon_cloud_localization/CMakeLists.txt
+@@ -33,12 +33,32 @@
+ target_link_directories(mid360_sim PRIVATE ${GAZEBO_LIBRARY_DIRS})
+ target_link_libraries(mid360_sim ${GAZEBO_LIBRARIES})
+ ament_target_dependencies(mid360_sim gazebo_ros rclcpp sensor_msgs geometry_msgs nav_msgs)
+-add_executable(loop_closure_pgo src/loop_closure_pgo.cpp src/global_relocalization.cpp)
++include(cmake/3d_bbs.cmake)
++add_library(robocon_global_registration STATIC src/global_relocalization.cpp src/bbs_relocalization.cpp)
++target_include_directories(robocon_global_registration PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src ${PCL_INCLUDE_DIRS})
++target_link_libraries(robocon_global_registration PUBLIC ${PCL_LIBRARIES} robocon_bbs_cpu)
++if(TARGET robocon_bbs_gpu)
++  target_link_libraries(robocon_global_registration PUBLIC robocon_bbs_gpu)
++  target_compile_definitions(robocon_global_registration PRIVATE ROBOCON_HAS_BBS_CUDA)
++endif()
++add_executable(loop_closure_pgo src/loop_closure_pgo.cpp)
++add_executable(relocalization_benchmark src/relocalization_benchmark.cpp)
++target_link_libraries(relocalization_benchmark robocon_global_registration)
++if(BUILD_TESTING)
++  enable_testing()
++  add_executable(registration_contract_test test/registration_contract_test.cpp)
++  target_link_libraries(registration_contract_test robocon_global_registration)
++  add_test(NAME registration_contract_cpu COMMAND registration_contract_test bbs_cpu_gicp)
++  if(TARGET robocon_bbs_gpu)
++    add_test(NAME registration_contract_gpu COMMAND registration_contract_test bbs_gpu_gicp)
++  endif()
++endif()
+ target_include_directories(loop_closure_pgo PRIVATE ${PCL_INCLUDE_DIRS})
+-target_link_libraries(loop_closure_pgo ${PCL_LIBRARIES} gtsam)
++target_link_libraries(loop_closure_pgo robocon_global_registration ${PCL_LIBRARIES} gtsam)
+ ament_target_dependencies(loop_closure_pgo rclcpp sensor_msgs nav_msgs geometry_msgs std_srvs tf2_ros pcl_conversions)
+ install(TARGETS mid360_sim LIBRARY DESTINATION lib)
+ install(TARGETS loop_closure_pgo DESTINATION lib/${PROJECT_NAME})
++install(TARGETS relocalization_benchmark DESTINATION lib/${PROJECT_NAME})
+ install(DIRECTORY launch config worlds models urdf maps DESTINATION share/${PROJECT_NAME})
+ install(PROGRAMS scripts/drive.py scripts/verify_sim.py DESTINATION lib/${PROJECT_NAME})
+ ament_package()
+--- a/src/robocon_cloud_localization/config/localization.yaml
++++ b/src/robocon_cloud_localization/config/localization.yaml
+@@ -35,6 +35,9 @@
+     # repeated failures search the map bounds in XYZ and all yaw angles in a
+     # background worker, then verify the candidate on fresh consecutive scans.
+     localization_global_enabled: true
++    # Shared input/output, GICP refinement and quality checks for A/B tests.
++    # grid_gicp: V1; bbs_cpu_gicp / bbs_gpu_gicp: official 3D-BBS V2.
++    localization_global_backend: bbs_gpu_gicp
+     localization_global_failure_frames: 10
+     localization_global_retry_seconds: 5.0
+     localization_global_voxel: 0.25  # coarse distance grid, m
+@@ -43,4 +46,12 @@
+     localization_global_yaw_step: 0.2617993878  # 15 degrees, radians
+     localization_global_refine_candidates: 32
+     localization_global_ambiguity_ratio: 1.25  # reject similarly good distinct locations
++    localization_bbs_resolution: 0.20  # finest occupied voxel resolution, m
++    localization_bbs_levels: 5  # hierarchy levels 0..5; expansion factor 2
++    localization_bbs_scan_voxel: 0.25  # query scan downsampling, m
++    localization_bbs_roll_pitch_window: 0.035  # residual radians after tilt prealignment
++    localization_bbs_score_threshold: 0.60  # occupied voxel fraction, not GICP fitness
++    localization_bbs_timeout_ms: 3000  # search only; map setup/refinement measured separately
++    localization_bbs_cpu_threads: 2
++    localization_bbs_gpu_batch_size: 10000
+     map_publish_rate: 1.0
+--- a/src/robocon_cloud_localization/launch/localization.launch.py
++++ b/src/robocon_cloud_localization/launch/localization.launch.py
+@@ -12,6 +12,9 @@
+     simulation = share / 'launch' / 'simulation.launch.py'
+     return LaunchDescription([
+         DeclareLaunchArgument('gui', default_value='true', description='Show Gazebo and RViz'),
++        DeclareLaunchArgument('relocalization_backend', default_value='bbs_gpu_gicp',
++                              choices=['grid_gicp', 'bbs_cpu_gicp', 'bbs_gpu_gicp'],
++                              description='Global search algorithm; GICP refinement is shared'),
+         DeclareLaunchArgument('initial_x', default_value='-5.15', description='Waffle start x in the upper-left field start area'),
+         DeclareLaunchArgument('initial_y', default_value='5.15', description='Waffle start y in the upper-left field start area'),
+         # mid360_sim_1.pcd is a FAST-LIO map in its own local frame, anchored
+@@ -36,6 +39,7 @@
+             PythonLaunchDescriptionSource(str(simulation)),
+             launch_arguments={
+                 'mode': 'localize',
++                'relocalization_backend': LaunchConfiguration('relocalization_backend'),
+                 'gui': LaunchConfiguration('gui'),
+                 'initial_x': LaunchConfiguration('initial_x'),
+                 'initial_y': LaunchConfiguration('initial_y'),
+--- a/src/robocon_cloud_localization/launch/simulation.launch.py
++++ b/src/robocon_cloud_localization/launch/simulation.launch.py
+@@ -182,6 +182,7 @@
+                 str(localization_config_path),
+                 {
+                     "mode": mode,
++                    "localization_global_backend": LaunchConfiguration("relocalization_backend"),
+                     "map_directory": str(root / "maps" / "fastlio_mid360_downward"),
+                     "map_file": map_file,
+                     "initial_pose_x": ParameterValue(guess_x, value_type=float),
+@@ -230,6 +231,9 @@
+             # from a normal ROS-sourced terminal.
+             UnsetEnvironmentVariable(name="ROS_LOCALHOST_ONLY"),
+             DeclareLaunchArgument("mode", default_value="map", description="map or localize"),
++            DeclareLaunchArgument("relocalization_backend", default_value="bbs_gpu_gicp",
++                                  choices=["grid_gicp", "bbs_cpu_gicp", "bbs_gpu_gicp"],
++                                  description="Global recovery backend (shared GICP refinement)"),
+             DeclareLaunchArgument(
+                 "world",
+                 default_value=str(default_world_path),
+--- a/src/robocon_cloud_localization/src/global_relocalization.cpp
++++ b/src/robocon_cloud_localization/src/global_relocalization.cpp
+@@ -5,6 +5,8 @@
+ #include <pcl/search/kdtree.h>
+ #include <Eigen/Geometry>
+ #include <algorithm>
++#include <chrono>
++#include <stdexcept>
+ #include <cmath>
+ #include <limits>
+ #include <sstream>
+@@ -29,10 +31,10 @@
+ }
+ }  // namespace
+ 
+-GlobalResult globalRelocalize(const RegistrationCloud::ConstPtr &scan,
++static GlobalSeeds gridSearch(const RegistrationCloud::ConstPtr &scan,
+                              const RegistrationCloud::ConstPtr &map,
+                              const Eigen::Matrix4f &guess, const GlobalOptions &opt) {
+-  GlobalResult result;
++  GlobalSeeds result;
+   auto target = filtered(map, opt.voxel);
+   auto source = filtered(scan, opt.voxel);
+   if (target->size()<50 || source->size()<50) {
+@@ -116,6 +118,16 @@
+       seeds.push_back(candidate);
+     if(seeds.size()>=static_cast<size_t>(opt.refine_candidates)) break;
+   }
++  for (const auto &seed : seeds) result.poses.push_back(seed.pose);
++  result.detail=std::to_string(hypotheses)+" grid poses, "+std::to_string(seeds.size())+" GICP refinements";
++  return result;
++}
++
++GlobalResult refineGlobalCandidates(const RegistrationCloud::ConstPtr &scan,
++  const RegistrationCloud::ConstPtr &map, const std::vector<Eigen::Matrix4f> &seeds,
++  const GlobalOptions &opt) {
++  GlobalResult result;
++  const double max_cost=0.90*0.90;
+   pcl::search::KdTree<pcl::PointXYZI> tree;tree.setInputCloud(map);
+   auto refine_source=filtered(scan,0.12f);
+   std::vector<Candidate> accepted;
+@@ -125,7 +137,7 @@
+     gicp.setMaximumIterations(45);gicp.setMaxCorrespondenceDistance(0.90);
+     gicp.setTransformationEpsilon(1e-5);gicp.setEuclideanFitnessEpsilon(1e-5);
+     gicp.setInputSource(refine_source);gicp.setInputTarget(map);
+-    RegistrationCloud aligned;gicp.align(aligned,seed.pose);
++    RegistrationCloud aligned;gicp.align(aligned,seed);
+     if(!gicp.hasConverged() || !gicp.getFinalTransformation().allFinite())continue;
+     // Score ALL points, counting misses. Fitness on just the nearest subset
+     // otherwise lets a small overlapping floor patch look like a good match.
+@@ -142,8 +154,7 @@
+     accepted.push_back({score,gicp.getFinalTransformation()});overlaps.push_back(overlap);
+   }
+   if(accepted.empty()) {
+-    result.detail="no validated global candidate ("+std::to_string(hypotheses)+" grid poses, "+
+-      std::to_string(seeds.size())+" GICP refinements)";return result;
++    result.detail="no validated global candidate";return result;
+   }
+   const size_t best=std::min_element(accepted.begin(),accepted.end(),
+     [](const Candidate &a,const Candidate &b){return a.score<b.score;})-accepted.begin();
+@@ -156,7 +167,63 @@
+   }
+   result.found=true;result.pose=accepted[best].pose;result.fitness=accepted[best].score;
+   result.overlap=overlaps[best];
+-  result.detail=std::to_string(hypotheses)+" grid poses, "+std::to_string(seeds.size())+" GICP refinements";
++  result.detail="GICP validation passed";
+   return result;
+ }
++
++
++class GridSearchBackend final : public GlobalSearchBackend {
++ public:
++  GridSearchBackend(RegistrationCloud::ConstPtr map, GlobalOptions options)
++    : map_(std::move(map)),options_(std::move(options)) {}
++  const char *name() const override {return "grid_gicp";}
++  GlobalSeeds search(const RegistrationCloud::ConstPtr &scan, const Eigen::Matrix4f &guess) override {
++    return gridSearch(scan,map_,guess,options_);
++  }
++ private:
++  RegistrationCloud::ConstPtr map_;
++  GlobalOptions options_;
++};
++std::shared_ptr<GlobalSearchBackend> makeBbsSearchBackend(
++  const RegistrationCloud::ConstPtr &map,const GlobalOptions &options);
++std::shared_ptr<GlobalSearchBackend> makeGlobalSearchBackend(
++  const RegistrationCloud::ConstPtr &map,const GlobalOptions &options) {
++  if(!map || map->empty())throw std::invalid_argument("Global registration requires a nonempty map");
++  if(!std::isfinite(options.bbs_resolution)||options.bbs_resolution<=0 ||
++     !std::isfinite(options.bbs_scan_voxel)||options.bbs_scan_voxel<=0 ||
++     !std::isfinite(options.bbs_roll_pitch_window)||options.bbs_roll_pitch_window<=0 ||
++     !std::isfinite(options.bbs_score_threshold)||options.bbs_score_threshold<=0||options.bbs_score_threshold>=1 ||
++     options.bbs_levels<1 || options.bbs_levels>8 || options.bbs_timeout_ms<1 ||
++     options.bbs_cpu_threads<1 || options.bbs_gpu_batch_size<1)
++    throw std::invalid_argument("Invalid BBS configuration");
++  if (options.backend=="grid_gicp") return std::make_shared<GridSearchBackend>(map,options);
++  if (options.backend=="bbs_cpu_gicp" || options.backend=="bbs_gpu_gicp")
++    return makeBbsSearchBackend(map,options);
++  throw std::invalid_argument("Unknown relocalization backend: "+options.backend);
++}
++GlobalResult globalRelocalize(const RegistrationCloud::ConstPtr &scan,
++  const RegistrationCloud::ConstPtr &map,const Eigen::Matrix4f &guess,
++  const GlobalOptions &options,const std::shared_ptr<GlobalSearchBackend> &prepared) {
++  using Clock=std::chrono::steady_clock;
++  const auto begin=Clock::now();
++  if(!scan || scan->size()<50 || !guess.allFinite()) {
++    GlobalResult invalid;invalid.backend=options.backend;
++    invalid.detail="Invalid/insufficient scan or nonfinite initial rotation";return invalid;
++  }
++  auto backend=prepared ? prepared : makeGlobalSearchBackend(map,options);
++  if(options.backend!=backend->name())
++    throw std::invalid_argument("Cached search backend differs from GlobalOptions.backend");
++  auto seeds=backend->search(scan,guess);
++  const auto searched=Clock::now();
++  auto result=refineGlobalCandidates(scan,map,seeds.poses,options);
++  const auto end=Clock::now();
++  result.backend=backend->name();result.timed_out=seeds.timed_out;
++  result.map_build_ms=seeds.map_build_ms;result.coarse_score=seeds.coarse_score;
++  result.search_ms=std::chrono::duration<double,std::milli>(searched-begin).count()-seeds.map_build_ms;
++  result.refine_ms=std::chrono::duration<double,std::milli>(end-searched).count();
++  result.total_ms=std::chrono::duration<double,std::milli>(end-begin).count();
++  if(seeds.timed_out) {result.found=false;result.detail="BBS timeout; no global solution accepted";}
++  result.detail=std::string(backend->name())+": "+seeds.detail+"; "+result.detail;
++  return result;
++}
+ }  // namespace robocon
+--- a/src/robocon_cloud_localization/src/global_relocalization.hpp
++++ b/src/robocon_cloud_localization/src/global_relocalization.hpp
+@@ -4,10 +4,13 @@
+ #include <pcl/point_types.h>
+ #include <Eigen/Core>
+ #include <string>
++#include <memory>
++#include <vector>
+ 
+ namespace robocon {
+ using RegistrationCloud = pcl::PointCloud<pcl::PointXYZI>;
+ struct GlobalOptions {
++  std::string backend = "grid_gicp";
+   double voxel = 0.25;
+   double xy_step = 0.50;
+   double z_step = 0.50;
+@@ -17,6 +20,14 @@
+   double inlier_distance = 0.20;
+   double overlap_min = 0.60;
+   double ambiguity_ratio = 1.25;
++  double bbs_resolution = 0.20;
++  int bbs_levels = 5;
++  double bbs_scan_voxel = 0.25;
++  double bbs_roll_pitch_window = 0.035;
++  double bbs_score_threshold = 0.60;
++  int bbs_timeout_ms = 3000;
++  int bbs_cpu_threads = 2;
++  int bbs_gpu_batch_size = 10000;
+ };
+ struct GlobalResult {
+   bool found = false;
+@@ -24,11 +35,41 @@
+   double fitness = 0.0;
+   double overlap = 0.0;
+   std::string detail;
++  std::string backend;
++  bool timed_out = false;
++  double map_build_ms = 0.0;
++  double search_ms = 0.0;
++  double refine_ms = 0.0;
++  double total_ms = 0.0;
++  double coarse_score = 0.0;  // BBS occupied voxel fraction, not GICP fitness
+ };
++struct GlobalSeeds {
++  std::vector<Eigen::Matrix4f> poses;
++  std::string detail;
++  bool timed_out = false;
++  double map_build_ms = 0.0;
++  double coarse_score = 0.0;
++};
++// Interchangeable coarse search interface. Map data are immutable. Instances
++// cache map preparation and are called by one background worker at a time.
++class GlobalSearchBackend {
++ public:
++  virtual ~GlobalSearchBackend() = default;
++  virtual const char *name() const = 0;
++  virtual GlobalSeeds search(const RegistrationCloud::ConstPtr &scan,
++                            const Eigen::Matrix4f &guess) = 0;
++};
++std::shared_ptr<GlobalSearchBackend> makeGlobalSearchBackend(
++  const RegistrationCloud::ConstPtr &map, const GlobalOptions &options);
++GlobalResult refineGlobalCandidates(const RegistrationCloud::ConstPtr &scan,
++                                   const RegistrationCloud::ConstPtr &map,
++                                   const std::vector<Eigen::Matrix4f> &seeds,
++                                   const GlobalOptions &options);
+ // Search XYZ and yaw across the target bounds. Roll/pitch remain near the
+ // supplied gravity/mount estimate; GICP refines all six degrees of freedom.
+ GlobalResult globalRelocalize(const RegistrationCloud::ConstPtr &scan,
+                              const RegistrationCloud::ConstPtr &map,
+                              const Eigen::Matrix4f &guess,
+-                             const GlobalOptions &options);
++                             const GlobalOptions &options,
++                             const std::shared_ptr<GlobalSearchBackend> &backend = {});
+ }  // namespace robocon
+--- a/src/robocon_cloud_localization/src/loop_closure_pgo.cpp
++++ b/src/robocon_cloud_localization/src/loop_closure_pgo.cpp
+@@ -89,6 +89,7 @@
+     declare_parameter("localization_initial_consistency_translation", 0.10);
+     declare_parameter("localization_initial_consistency_rotation", 0.05);
+     declare_parameter("localization_global_enabled", true);
++    declare_parameter("localization_global_backend", "bbs_gpu_gicp");
+     declare_parameter("localization_global_failure_frames", 10);
+     declare_parameter("localization_global_retry_seconds", 5.0);
+     declare_parameter("localization_global_voxel", 0.25);
+@@ -97,6 +98,14 @@
+     declare_parameter("localization_global_yaw_step", 0.2617993878);
+     declare_parameter("localization_global_refine_candidates", 32);
+     declare_parameter("localization_global_ambiguity_ratio", 1.25);
++    declare_parameter("localization_bbs_resolution", 0.20);
++    declare_parameter("localization_bbs_levels", 5);
++    declare_parameter("localization_bbs_scan_voxel", 0.25);
++    declare_parameter("localization_bbs_roll_pitch_window", 0.035);
++    declare_parameter("localization_bbs_score_threshold", 0.60);
++    declare_parameter("localization_bbs_timeout_ms", 3000);
++    declare_parameter("localization_bbs_cpu_threads", 2);
++    declare_parameter("localization_bbs_gpu_batch_size", 10000);
+     declare_parameter("map_publish_rate", 1.0);
+     declare_parameter("initial_pose_x", 0.0);
+     declare_parameter("initial_pose_y", 0.0);
+@@ -131,6 +140,21 @@
+         get_parameter("localization_global_yaw_step").as_double()>M_PI ||
+         get_parameter("localization_global_ambiguity_ratio").as_double()<1.0)
+       throw std::runtime_error("Invalid global relocalization search parameters");
++    const auto backend=get_parameter("localization_global_backend").as_string();
++    if(backend!="grid_gicp" && backend!="bbs_cpu_gicp" && backend!="bbs_gpu_gicp")
++      throw std::runtime_error("localization_global_backend must be grid_gicp, bbs_cpu_gicp or bbs_gpu_gicp");
++    for(const auto *key:{"localization_bbs_resolution","localization_bbs_scan_voxel",
++                         "localization_bbs_roll_pitch_window"}) {
++      const double value=get_parameter(key).as_double();
++      if(!std::isfinite(value)||value<=0.0)throw std::runtime_error(std::string(key)+" must be finite and positive");
++    }
++    const double score=get_parameter("localization_bbs_score_threshold").as_double();
++    if(!std::isfinite(score)||score<=0.0||score>=1.0 ||
++       get_parameter("localization_bbs_levels").as_int()<1||get_parameter("localization_bbs_levels").as_int()>8||
++       get_parameter("localization_bbs_timeout_ms").as_int()<1||
++       get_parameter("localization_bbs_cpu_threads").as_int()<1||
++       get_parameter("localization_bbs_gpu_batch_size").as_int()<1)
++      throw std::runtime_error("Invalid BBS search parameters");
+     const auto robust = gtsam::noiseModel::Robust::Create(
+       gtsam::noiseModel::mEstimator::Huber::Create(1.5),
+       gtsam::noiseModel::Diagonal::Sigmas((gtsam::Vector(6) << .04,.04,.04,.025,.025,.035).finished()));
+@@ -386,6 +410,10 @@
+     }
+     // Discard results superseded by a manual pose or successful local alignment.
+     if (global_generation_!=localization_generation_ || localization_aligned_) return;
++    RCLCPP_INFO(get_logger(),
++      "Global backend=%s found=%s timeout=%s map_build_ms=%.2f search_ms=%.2f refine_ms=%.2f total_ms=%.2f coarse_score=%.3f",
++      result.backend.c_str(),result.found?"true":"false",result.timed_out?"true":"false",
++      result.map_build_ms,result.search_ms,result.refine_ms,result.total_ms,result.coarse_score);
+     if (!result.found) {
+       RCLCPP_WARN(get_logger(),"Global relocalization not accepted: %s",result.detail.c_str());return;
+     }
+@@ -409,6 +437,7 @@
+           get_parameter("localization_global_retry_seconds").as_double()) return;
+     last_global_search_=steady;
+     robocon::GlobalOptions options;
++    options.backend=get_parameter("localization_global_backend").as_string();
+     options.voxel=get_parameter("localization_global_voxel").as_double();
+     options.xy_step=get_parameter("localization_global_xy_step").as_double();
+     options.z_step=get_parameter("localization_global_z_step").as_double();
+@@ -418,14 +447,30 @@
+     options.inlier_distance=get_parameter("localization_initial_inlier_distance").as_double();
+     options.overlap_min=get_parameter("localization_initial_inlier_ratio_min").as_double();
+     options.ambiguity_ratio=get_parameter("localization_global_ambiguity_ratio").as_double();
++    options.bbs_resolution=get_parameter("localization_bbs_resolution").as_double();
++    options.bbs_levels=get_parameter("localization_bbs_levels").as_int();
++    options.bbs_scan_voxel=get_parameter("localization_bbs_scan_voxel").as_double();
++    options.bbs_roll_pitch_window=get_parameter("localization_bbs_roll_pitch_window").as_double();
++    options.bbs_score_threshold=get_parameter("localization_bbs_score_threshold").as_double();
++    options.bbs_timeout_ms=get_parameter("localization_bbs_timeout_ms").as_int();
++    options.bbs_cpu_threads=get_parameter("localization_bbs_cpu_threads").as_int();
++    options.bbs_gpu_batch_size=get_parameter("localization_bbs_gpu_batch_size").as_int();
++    try {
++      if(!global_backend_ || global_backend_->name()!=options.backend)
++        global_backend_=robocon::makeGlobalSearchBackend(map_cloud_,options);
++    } catch(const std::exception &e) {
++      RCLCPP_ERROR(get_logger(),"Cannot start global backend %s: %s",options.backend.c_str(),e.what());
++      return;
++    }
+     global_generation_=localization_generation_;global_wheel_start_=latest_wheel_;
+     global_requested_=false;
+     const Cloud::ConstPtr target=map_cloud_,source=cloud;
+     const Eigen::Matrix4f guess=predicted.matrix().cast<float>();
+-    RCLCPP_WARN(get_logger(),"Starting global XYZ/yaw map search after %d rejected scans; local TF/map publishing continues",
+-      localization_failures_);
+-    global_search_=std::async(std::launch::async,[source,target,guess,options] {
+-      return robocon::globalRelocalize(source,target,guess,options);
++    RCLCPP_WARN(get_logger(),"Starting global backend=%s after %d rejected scans; local TF/map publishing continues",
++      options.backend.c_str(),localization_failures_);
++    const auto prepared=global_backend_;
++    global_search_=std::async(std::launch::async,[source,target,guess,options,prepared] {
++      return robocon::globalRelocalize(source,target,guess,options,prepared);
+     });
+   }
+   void localizationFailure(const Cloud::Ptr &cloud,const gtsam::Pose3 &predicted,
+@@ -710,6 +755,7 @@
+   gtsam::Pose3 global_wheel_start_;
+   std::chrono::steady_clock::time_point last_global_search_;
+   std::future<robocon::GlobalResult> global_search_;
++  std::shared_ptr<robocon::GlobalSearchBackend> global_backend_;
+   std::vector<Keyframe> keyframes_;Cloud::Ptr map_cloud_{new Cloud};
+   gtsam::NonlinearFactorGraph graph_;gtsam::Values initials_,optimized_;
+   std::unique_ptr<gtsam::ISAM2> isam_;gtsam::SharedNoiseModel loop_noise_,wheel_noise_,lio_noise_,prior_noise_;
+--- /dev/null
++++ b/src/robocon_cloud_localization/src/bbs_relocalization.cpp
+@@ -0,0 +1,104 @@
++#include "global_relocalization.hpp"
++#include <cpu_bbs3d/bbs3d.hpp>
++#ifdef ROBOCON_HAS_BBS_CUDA
++#include <gpu_bbs3d/bbs3d.cuh>
++#include <cuda_runtime_api.h>
++#endif
++#include <pcl/common/common.h>
++#include <pcl/filters/voxel_grid.h>
++#include <Eigen/Geometry>
++#include <chrono>
++#include <stdexcept>
++#include <type_traits>
++
++namespace robocon {
++namespace {
++template<typename Scalar,typename Engine>
++class BbsBackend final : public GlobalSearchBackend {
++ public:
++  BbsBackend(RegistrationCloud::ConstPtr map,GlobalOptions opt)
++    :map_(std::move(map)),options_(std::move(opt)) {}
++  const char *name() const override {return options_.backend.c_str();}
++  GlobalSeeds search(const RegistrationCloud::ConstPtr &scan,const Eigen::Matrix4f &guess) override {
++    GlobalSeeds result;
++    if(!engine_) {
++      const auto begin=std::chrono::steady_clock::now();
++#ifdef ROBOCON_HAS_BBS_CUDA
++      if constexpr(std::is_same_v<Engine,gpu::BBS3D>) {
++        int count=0;
++        const auto error=cudaGetDeviceCount(&count);
++        if(error!=cudaSuccess || count<1)
++          throw std::runtime_error("bbs_gpu_gicp requires a working CUDA GPU; select bbs_cpu_gicp explicitly");
++      }
++#endif
++      engine_=std::make_unique<Engine>();
++      if constexpr(std::is_same_v<Engine,cpu::BBS3D>)
++        engine_->set_num_threads(options_.bbs_cpu_threads);
++#ifdef ROBOCON_HAS_BBS_CUDA
++      else engine_->set_branch_copy_size(options_.bbs_gpu_batch_size);
++#endif
++      std::vector<Eigen::Matrix<Scalar,3,1>> target;
++      for(const auto &p:map_->points)
++        if(std::isfinite(p.x)&&std::isfinite(p.y)&&std::isfinite(p.z))target.emplace_back(p.x,p.y,p.z);
++      if(target.size()<50)throw std::runtime_error("Too few finite map points for BBS");
++      engine_->set_tar_points(target,options_.bbs_resolution,options_.bbs_levels);
++      pcl::PointXYZI lo,hi;pcl::getMinMax3D(*map_,lo,hi);
++      engine_->set_trans_search_range(Eigen::Matrix<Scalar,3,1>(lo.x-1,lo.y-1,lo.z-1),
++                                     Eigen::Matrix<Scalar,3,1>(hi.x+1,hi.y+1,hi.z+1));
++      result.map_build_ms=std::chrono::duration<double,std::milli>(
++        std::chrono::steady_clock::now()-begin).count();
++    }
++    // Gravity/mount prealignment: BBS residual roll/pitch remain centered on
++    // zero even for a downward sensor or a map with downward Z. Compose the
++    // returned pose with this rotation to map the original scan correctly.
++    const float yaw=std::atan2(guess(1,0),guess(0,0));
++    const Eigen::Matrix3f tilt=Eigen::AngleAxisf(-yaw,Eigen::Vector3f::UnitZ())*guess.block<3,3>(0,0);
++    Eigen::Matrix4f prealignment=Eigen::Matrix4f::Identity();prealignment.block<3,3>(0,0)=tilt;
++    RegistrationCloud filtered;
++    pcl::VoxelGrid<pcl::PointXYZI> filter;filter.setInputCloud(scan);
++    filter.setLeafSize(options_.bbs_scan_voxel,options_.bbs_scan_voxel,options_.bbs_scan_voxel);
++    filter.filter(filtered);
++    std::vector<Eigen::Matrix<Scalar,3,1>> source;
++    for(const auto &p:filtered.points) {
++      if(!std::isfinite(p.x)||!std::isfinite(p.y)||!std::isfinite(p.z))continue;
++      const Eigen::Vector3f aligned=tilt*Eigen::Vector3f(p.x,p.y,p.z);
++      source.push_back(aligned.template cast<Scalar>());
++    }
++    if(source.size()<50){result.detail="too few finite scan points for BBS";return result;}
++    const Scalar window=options_.bbs_roll_pitch_window;
++    engine_->set_src_points(source);
++    engine_->set_angular_search_range(Eigen::Matrix<Scalar,3,1>(-window,-window,-M_PI),
++                                      Eigen::Matrix<Scalar,3,1>(window,window,M_PI));
++    engine_->set_score_threshold_percentage(options_.bbs_score_threshold);
++    engine_->enable_timeout();engine_->set_timeout_duration_in_msec(options_.bbs_timeout_ms);
++    engine_->localize();
++    result.timed_out=engine_->has_timed_out();
++    result.coarse_score=engine_->get_best_score_percentage();
++    if(engine_->has_localized()&&!result.timed_out) {
++      for(const auto &pose:engine_->get_candidate_poses())
++        result.poses.push_back(pose.template cast<float>()*prealignment);
++      if(result.poses.empty())result.poses.push_back(engine_->get_global_pose().template cast<float>()*prealignment);
++    }
++    result.detail="official 3D-BBS, occupied_voxel_fraction="+std::to_string(result.coarse_score)+
++      ", candidates="+std::to_string(result.poses.size())+", search_ms="+
++      std::to_string(engine_->get_elapsed_time());
++    return result;
++  }
++ private:
++  RegistrationCloud::ConstPtr map_;
++  GlobalOptions options_;
++  std::unique_ptr<Engine> engine_;
++};
++}  // namespace
++
++std::shared_ptr<GlobalSearchBackend> makeBbsSearchBackend(
++  const RegistrationCloud::ConstPtr &map,const GlobalOptions &opt) {
++  if(opt.backend=="bbs_cpu_gicp")return std::make_shared<BbsBackend<double,cpu::BBS3D>>(map,opt);
++#ifdef ROBOCON_HAS_BBS_CUDA
++  if(opt.backend=="bbs_gpu_gicp")return std::make_shared<BbsBackend<float,gpu::BBS3D>>(map,opt);
++#else
++  if(opt.backend=="bbs_gpu_gicp")throw std::runtime_error("CUDA BBS backend was not built; select bbs_cpu_gicp");
++#endif
++  throw std::invalid_argument("Unknown BBS backend: "+opt.backend);
++}
++}  // namespace robocon
+--- /dev/null
++++ b/src/robocon_cloud_localization/src/relocalization_benchmark.cpp
+@@ -0,0 +1,50 @@
++#include "global_relocalization.hpp"
++#include <pcl/io/pcd_io.h>
++#include <pcl/filters/voxel_grid.h>
++#include <Eigen/Geometry>
++#include <iomanip>
++#include <iostream>
++#include <stdexcept>
++
++static robocon::RegistrationCloud::Ptr load(const std::string &path) {
++  robocon::RegistrationCloud::Ptr source(new robocon::RegistrationCloud),out(new robocon::RegistrationCloud);
++  if(pcl::io::loadPCDFile(path,*source)<0 || source->empty())
++    throw std::runtime_error("Cannot read PCD: "+path);
++  pcl::VoxelGrid<pcl::PointXYZI> filter;filter.setInputCloud(source);
++  filter.setLeafSize(.10f,.10f,.10f);filter.filter(*out);return out;
++}
++int main(int argc,char **argv) {
++  if(argc!=4 && argc!=5 && argc!=8) {
++    std::cerr<<"Usage: relocalization_benchmark MAP.pcd SCAN.pcd BACKEND [REPEATS [ROLL PITCH YAW]]\n"
++      <<"BACKEND: grid_gicp | bbs_cpu_gicp | bbs_gpu_gicp; angles are radians\n";
++    return 2;
++  }
++  try {
++    auto map=load(argv[1]),scan=load(argv[2]);
++    robocon::GlobalOptions options;options.backend=argv[3];
++    auto backend=robocon::makeGlobalSearchBackend(map,options);
++    Eigen::Matrix4f guess=Eigen::Matrix4f::Identity();
++    if(argc==8)guess.block<3,3>(0,0)=(Eigen::AngleAxisf(std::stof(argv[7]),Eigen::Vector3f::UnitZ())*
++      Eigen::AngleAxisf(std::stof(argv[6]),Eigen::Vector3f::UnitY())*
++      Eigen::AngleAxisf(std::stof(argv[5]),Eigen::Vector3f::UnitX())).toRotationMatrix();
++    const int repeats=argc>=5?std::stoi(argv[4]):1;
++    if(repeats<1 || repeats>100)throw std::invalid_argument("REPEATS must be 1..100");
++    bool success=true;
++    for(int i=0;i<repeats;++i) {
++      const auto result=robocon::globalRelocalize(scan,map,guess,options,backend);
++      const Eigen::Vector3f rpy(std::atan2(result.pose(2,1),result.pose(2,2)),
++        std::atan2(-result.pose(2,0),std::hypot(result.pose(0,0),result.pose(1,0))),
++        std::atan2(result.pose(1,0),result.pose(0,0)));
++      std::cout<<std::fixed<<std::setprecision(6)
++        <<"RESULT {\"backend\":\""<<result.backend<<"\",\"run\":"<<i
++        <<",\"found\":"<<(result.found?"true":"false")<<",\"timed_out\":"<<(result.timed_out?"true":"false")
++        <<",\"map_build_ms\":"<<result.map_build_ms<<",\"search_ms\":"<<result.search_ms
++        <<",\"refine_ms\":"<<result.refine_ms<<",\"total_ms\":"<<result.total_ms
++        <<",\"coarse_score\":"<<result.coarse_score<<",\"fitness_m2\":"<<result.fitness
++        <<",\"overlap\":"<<result.overlap<<",\"xyz\":["<<result.pose(0,3)<<","<<result.pose(1,3)<<","<<result.pose(2,3)
++        <<"],\"rpy\":["<<rpy.x()<<","<<rpy.y()<<","<<rpy.z()<<"]}"<<std::endl;
++      std::cerr<<result.detail<<"\n";success=success&&result.found;
++    }
++    return success?0:1;
++  } catch(const std::exception &e) {std::cerr<<e.what()<<"\n";return 2;}
++}
+--- /dev/null
++++ b/src/robocon_cloud_localization/cmake/3d_bbs.cmake
+@@ -0,0 +1,34 @@
++# Pinned upstream sources, built in this workspace without sudo/global installs.
++set(BBS_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../vendor/3d_bbs")
++if(NOT EXISTS "${BBS_ROOT}/bbs3d/include/cpu_bbs3d/bbs3d.hpp")
++  message(FATAL_ERROR "Missing 3D-BBS: git clone https://github.com/KOKIAOKI/3d_bbs.git ${BBS_ROOT}")
++endif()
++find_package(Eigen3 3.4 REQUIRED)
++find_package(OpenMP REQUIRED)
++add_library(robocon_bbs_cpu STATIC
++  ${BBS_ROOT}/bbs3d/src/cpu_bbs3d/bbs3d.cpp
++  ${BBS_ROOT}/bbs3d/src/cpu_bbs3d/voxelmaps.cpp
++  ${BBS_ROOT}/bbs3d/src/cpu_bbs3d/voxelmaps_io.cpp)
++target_include_directories(robocon_bbs_cpu SYSTEM PUBLIC ${BBS_ROOT}/bbs3d/include)
++target_link_libraries(robocon_bbs_cpu PUBLIC Eigen3::Eigen OpenMP::OpenMP_CXX)
++option(ROBOCON_BBS_CUDA "Build official CUDA 3D-BBS backend" ON)
++if(ROBOCON_BBS_CUDA)
++  include(CheckLanguage)
++  check_language(CUDA)
++  if(CMAKE_CUDA_COMPILER)
++    enable_language(CUDA)
++    find_package(CUDAToolkit REQUIRED)
++    add_library(robocon_bbs_gpu STATIC
++      ${BBS_ROOT}/bbs3d/src/gpu_bbs3d/bbs3d.cu
++      ${BBS_ROOT}/bbs3d/src/gpu_bbs3d/calc_score.cu
++      ${BBS_ROOT}/bbs3d/src/gpu_bbs3d/voxelmaps.cu
++      ${BBS_ROOT}/bbs3d/src/gpu_bbs3d/voxelmaps_io.cu
++      ${BBS_ROOT}/bbs3d/src/gpu_bbs3d/stream_manager/check_error.cu)
++    set_target_properties(robocon_bbs_gpu PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
++    target_include_directories(robocon_bbs_gpu SYSTEM PUBLIC ${BBS_ROOT}/bbs3d/include)
++    target_compile_options(robocon_bbs_gpu PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
++    target_link_libraries(robocon_bbs_gpu PUBLIC Eigen3::Eigen CUDA::cudart)
++  else()
++    message(WARNING "CUDA not found: bbs_cpu_gicp/grid_gicp available, bbs_gpu_gicp will report an error")
++  endif()
++endif()
+--- /dev/null
++++ b/src/robocon_cloud_localization/test/registration_contract_test.cpp
+@@ -0,0 +1,56 @@
++#include "global_relocalization.hpp"
++#include <Eigen/Geometry>
++#include <cmath>
++#include <iostream>
++#include <limits>
++#include <stdexcept>
++#include <random>
++
++static void require(bool condition,const char *message) {
++  if(!condition)throw std::runtime_error(message);
++}
++int main(int argc,char **argv) {
++  try {
++    const std::string backend=argc>1?argv[1]:"bbs_cpu_gicp";
++    robocon::RegistrationCloud::Ptr source(new robocon::RegistrationCloud),map(new robocon::RegistrationCloud);
++    std::mt19937 random(19);std::uniform_real_distribution<float> value(-2,2);
++    const Eigen::Matrix3f tilt=Eigen::AngleAxisf(float(M_PI),Eigen::Vector3f::UnitX()).toRotationMatrix();
++    const Eigen::Matrix3f rotation=Eigen::AngleAxisf(.40f,Eigen::Vector3f::UnitZ())*tilt;
++    const Eigen::Vector3f translation(.3f,-.4f,.6f);
++    for(int i=0;i<1500;++i) {
++      Eigen::Vector3f p(value(random),value(random),value(random));
++      // Asymmetric dense volume supplies an unambiguous six-DoF constraint.
++      p.z()*=.6f;p.x()+=.2f*p.y()*p.y();
++      pcl::PointXYZI a;a.x=p.x();a.y=p.y();a.z=p.z();a.intensity=0;source->push_back(a);
++      const Eigen::Vector3f q=rotation*p+translation;
++      pcl::PointXYZI b;b.x=q.x();b.y=q.y();b.z=q.z();b.intensity=0;map->push_back(b);
++    }
++    robocon::GlobalOptions options;options.backend=backend;
++    auto search=robocon::makeGlobalSearchBackend(map,options);
++    Eigen::Matrix4f guess=Eigen::Matrix4f::Identity();guess.block<3,3>(0,0)=tilt;
++    const auto aligned=robocon::globalRelocalize(source,map,guess,options,search);
++    require(aligned.found,"Downward-axis registration failed");
++    require((aligned.pose.block<3,1>(0,3)-translation).norm()<.03,"Incorrect XYZ");
++    require(Eigen::AngleAxisf(aligned.pose.block<3,3>(0,0)*rotation.transpose()).angle()<.03,"Incorrect tilt/yaw composition");
++    const auto cached=robocon::globalRelocalize(source,map,guess,options,search);
++    require(cached.found&&cached.map_build_ms==0,"Map was rebuilt on repeated query");
++    require(cached.backend==backend&&cached.total_ms>=cached.refine_ms,"Missing interface metrics");
++    robocon::RegistrationCloud::Ptr tiny(new robocon::RegistrationCloud);
++    require(!robocon::globalRelocalize(tiny,map,guess,options,search).found,"Accepted empty scan");
++    guess(0,0)=std::numeric_limits<float>::quiet_NaN();
++    require(!robocon::globalRelocalize(source,map,guess,options,search).found,"Accepted nonfinite guess");
++    options.bbs_timeout_ms=1;auto timeout_backend=robocon::makeGlobalSearchBackend(map,options);
++    const auto timeout=robocon::globalRelocalize(source,map,Eigen::Matrix4f::Identity(),options,timeout_backend);
++    require(timeout.timed_out&&!timeout.found,"Search timeout was not rejected");
++    options.backend="does_not_exist";
++    bool rejected=false;
++    try{robocon::makeGlobalSearchBackend(map,options);}catch(const std::invalid_argument &){rejected=true;}
++    require(rejected,"Unknown backend silently accepted");
++    rejected=false;
++    try{robocon::globalRelocalize(source,map,Eigen::Matrix4f::Identity(),options,search);}
++    catch(const std::invalid_argument &){rejected=true;}
++    require(rejected,"Cached backend mismatch silently accepted");
++    std::cout<<"PASS "<<backend<<": downward tilt, cached map, invalid inputs, timeout, unknown backend\n";
++    return 0;
++  } catch(const std::exception &e){std::cerr<<e.what()<<"\n";return 1;}
++}
+--- /dev/null
++++ b/docs/relocalization_backends.md
+@@ -0,0 +1,141 @@
++# 重定位 V2：3D-BBS 与 GICP 的切换接口
++
++全局搜索采用官方 [KOKIAOKI/3d_bbs](https://github.com/KOKIAOKI/3d_bbs)，固定版本
++`41529a34a2fb9618b5ff560fb3c2363f1615666d`，MIT 许可。
++这属于点云全局配准：多分辨率稀疏哈希体素 + 旋转/平移联合分支定界搜索，
++GPU 版本批量计算节点分数。它不做图优化，也不使用 Gazebo 真值。
++
++## 1. 直接切换测试
++
++在工作空间执行，三次实验分别启动，退出上一组 launch 后再启动下一组：
++
++```bash
++cd /home/alice/rc_2027/cloud_localization
++source scripts/env.sh
++
++# V1：原来的距离网格搜索 + GICP
++ros2 launch robocon_cloud_localization localization.launch.py relocalization_backend:=grid_gicp
++
++# V2：官方 CPU BnB + GICP
++ros2 launch robocon_cloud_localization localization.launch.py relocalization_backend:=bbs_cpu_gicp
++
++# V2：官方 CUDA 批量 BnB + GICP（当前默认）
++ros2 launch robocon_cloud_localization localization.launch.py relocalization_backend:=bbs_gpu_gicp
++```
++
++三种方案共用地图、输入扫描、GICP 精配准、重叠率/误差/歧义检查和连续三帧确认。
++日常局部跟踪始终使用原有 GICP。只有连续失败或显式请求时才调用所选全局搜索。
++测试时固定相同的 `map_file`、Gazebo 出生位置和初始定位位姿。例如在上述任一命令后加
++`initial_pose_x:=0.0 initial_pose_y:=0.0 initial_pose_yaw:=1.5708`。
++当前位置已能局部收敛时，应使用错误初值重新启动，确保确实测到全局搜索。
++
++当前外层 launch 的地图默认值是 `mid360_sim_2.pcd`；切换地图可以显式传入
++`map_file:=/home/alice/rc_2027/cloud_localization/src/robocon_cloud_localization/maps/mid360_sim_1.pcd`。
++
++`relocalization_backend` 是 launch 参数，写入节点 ROS 参数
++`localization_global_backend`，因此 **launch 参数覆盖 YAML 中同名 ROS 参数**。
++用以上命令选择算法最直接。只启动节点时，使用 `-p localization_global_backend:=...`。
++
++可核对实际选择，并主动请求搜索：
++
++```bash
++ros2 param get /scan_context_gicp_isam2 localization_global_backend
++ros2 service call /relocalize std_srvs/srv/Trigger '{}'
++```
++
++服务只确认已收到请求；后续扫描触发搜索。
++`Global backend=...` 输出计算结果，`Global relocalization candidate` 之后还需
++`GICP initialized` 才完成新扫描确认。局部对齐先完成时，会作废后台的旧搜索结果。
++
++## 2. C++ 算法接口
++
++声明：`src/robocon_cloud_localization/src/global_relocalization.hpp`。
++
++```cpp
++robocon::GlobalOptions options;
++options.backend = "bbs_gpu_gicp";  // grid_gicp / bbs_cpu_gicp / bbs_gpu_gicp
++auto backend = robocon::makeGlobalSearchBackend(map, options);  // 每张地图创建一次
++auto result = robocon::globalRelocalize(scan, map, guess, options, backend);
++if (result.found) {
++  Eigen::Matrix4f T_map_lidar = result.pose;
++}
++```
++
++- `map`：目标 PCD 地图，`pcl::PointCloud<pcl::PointXYZI>::ConstPtr`。
++- `scan`：当前雷达局部坐标系扫描，同一类型。不要传已经变换到 map 的点云。
++- `guess`：`Eigen::Matrix4f`，初始 `T_map_lidar`。BBS 不围绕它的 XYZ/yaw 做局部窗口搜索；
++  只使用其 roll/pitch 作为重力/安装方向预对齐。平移搜索覆盖地图边界外约 1 m，yaw 覆盖整圈。
++  BBS 额外搜索预对齐附近的 roll/pitch；GICP 最后精修完整 6DoF。
++- `result.pose`：`p_map = T_map_lidar * p_lidar`，只在 `found=true` 时有效。
++- `result` 另含 `backend`、`timed_out`、`detail`、`fitness`（全点截断距离 MSE，m²）、
++  `overlap`（0～1）、`coarse_score`（BBS 体素命中比例，0～1）及四个耗时字段。
++
++扩展第三种搜索器时，实现 `GlobalSearchBackend::search(scan, guess) -> GlobalSeeds`，
++返回候选 `T_map_lidar`，并在工厂注册名字。共同的 `refineGlobalCandidates` 继续承担 GICP 验证。
++后端实例绑定创建时的地图与搜索配置，地图需保持不变；换地图或调搜索参数后重新创建。
++一个实例每次只允许一个线程搜索。ROS 节点在单个后台任务中调用，缓存地图体素层级。
++未知算法、编译时未启用 GPU 或 GPU 不可用都会明确报错，不静默换算法。
++
++## 3. 参数位置与含义
++
++配置文件：`src/robocon_cloud_localization/config/localization.yaml`。
++调整 BBS 参数后重启节点，避免继续使用已缓存的配置/地图。
++
++| 参数 | 默认值 | 作用 |
++|---|---:|---|
++| `localization_bbs_resolution` | 0.20 m | 最细体素边长；固定分辨率，不随搜索量自动加粗 |
++| `localization_bbs_levels` | 5 | 最大层级，层级 0～5，每层边长翻倍 |
++| `localization_bbs_scan_voxel` | 0.25 m | BBS 查询点云降采样；不改变发布地图分辨率 |
++| `localization_bbs_roll_pitch_window` | 0.035 rad | 重力预对齐后 roll/pitch 搜索半宽 |
++| `localization_bbs_score_threshold` | 0.60 | BBS 占用体素命中比例下限，不是 GICP fitness |
++| `localization_bbs_timeout_ms` | 3000 ms | 搜索时限；不含地图初始化/GICP，检查间隔会有超时余量 |
++| `localization_bbs_cpu_threads` | 2 | CPU 评分线程数 |
++| `localization_bbs_gpu_batch_size` | 10000 | GPU 节点评分批量 |
++
++原 `localization_global_voxel/xy_step/z_step/yaw_step/refine_candidates` 仅控制 V1 网格搜索。
++共同的 GICP 验证仍使用 `localization_initial_fitness_max`、
++`localization_initial_inlier_distance/ratio_min` 和 `localization_global_ambiguity_ratio`。
++
++官方只输出一个最优位姿。本地对 CPU/GPU 核心做了小范围扩展：保留分数在最佳值 95% 以上、
++最多 8 个位置/yaw 不同的叶节点，送入共同的 GICP 歧义检查。
++空间去重阈值为 0.75 m / 0.35 rad。修改和许可记录见 `vendor/3d_bbs/ROBOCON_INTEGRATION.md`。
++这不是穷尽所有歧义位置的保证。重复结构仍可能需要 RViz 初值；roll/pitch 偏差超过窗口也可能失败。
++超时结果直接拒绝，不把未完成搜索当作定位成功。
++
++## 4. 离线公平比较
++
++新增独立 C++ 可执行程序，直接调用上述同一套代码，无需启动 Gazebo：
++
++```bash
++ros2 run robocon_cloud_localization relocalization_benchmark \
++  /absolute/map.pcd /absolute/scan_in_lidar_frame.pcd bbs_gpu_gicp 3 0 0 0
++```
++
++位置参数：`MAP SCAN BACKEND [REPEATS [ROLL PITCH YAW]]`，角度为弧度。
++地图/扫描先按 0.10 m 降采样，与当前 ROS 节点输入条件一致。
++在同一个进程里重复，第一轮含 BBS 地图建立/GPU 上下文初始化，后续使用缓存。
++每行 `RESULT {...}` 为 JSON：`map_build_ms`、`search_ms`、`refine_ms`、`total_ms`。
++总耗时含地图建立与 GICP，不含磁盘加载、ROS 等待和新扫描确认。
++退出码：0 全部成功；1 有匹配被拒绝；2 参数/运行错误。
++不要将单独的 BBS 搜索耗时与另一方案的总耗时比较。
++
++实测扫描、三种算法结果、ROS 回归日志和测试说明见
++`reports/relocalization_v2_bbs_20261101_201618/RESULTS.md`。
++
++## 5. 构建
++
++当前机器已经编译并验证 CPU/GPU。本机 CUDA 12.9、RTX 5060 Laptop，架构 120：
++
++```bash
++source scripts/env.sh
++MAKEFLAGS=-j1 CMAKE_BUILD_PARALLEL_LEVEL=1 colcon build \
++  --packages-select robocon_cloud_localization --symlink-install --executor sequential \
++  --cmake-args -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON \
++  -DROBOCON_BBS_CUDA=ON -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc \
++  -DCMAKE_CUDA_ARCHITECTURES=120
++ctest --test-dir build/robocon_cloud_localization --output-on-failure
++```
++
++其他 GPU 使用自己的 CUDA 路径和架构。无 CUDA 可传 `-DROBOCON_BBS_CUDA=OFF`，
++启动时选择 `bbs_cpu_gicp`。依赖 Eigen >= 3.4、OpenMP、PCL；上游代码已放入 `vendor/3d_bbs`，
++不向系统目录安装。换机复制源码时应保留该目录及其本地补丁，直接重新 clone 会丢失候选接口扩展。
+--- /dev/null
++++ b/vendor/3d_bbs/ROBOCON_INTEGRATION.md
+@@ -0,0 +1,28 @@
++# Robocon integration provenance
++
++Upstream: https://github.com/KOKIAOKI/3d_bbs
++
++Pinned revision: `41529a34a2fb9618b5ff560fb3c2363f1615666d`.
++MIT license and upstream copyright are retained in `LICENSE`.
++
++The workspace builds the CPU and optionally CUDA core with its own modern
++CMake targets (`src/robocon_cloud_localization/cmake/3d_bbs.cmake`). It does not
++build upstream demos or install into system directories.
++
++Local core extension, applied to both CPU and CUDA:
++
++- Collect up to eight spatially distinct leaf poses (0.75 m / 0.35 rad NMS).
++- Prune against 95% of the best occupancy count so near-best alternatives can
++  reach the common GICP ambiguity/quality checks. The best transform is still
++  updated only by an equal or better leaf. `set_candidate_score_ratio(1.0)`
++  restores the original best-score pruning threshold.
++- Expose `get_candidate_poses()` to the adapter. This bounded near-best set is
++  not an exhaustive list of every possible ambiguous location.
++
++Roto-translational branching, sparse hash voxelmaps and CUDA batched scoring
++remain upstream algorithms. Timeouts still invalidate the result, rather than
++returning an unfinished search as a globally verified solution. No node-count
++instrumentation is claimed; the wrapper reports actual wall times and scores.
++
++The patch against the pinned upstream commit is recorded in the workspace
++`reports/relocalization_v2_bbs_20261101_201618/upstream_candidates.patch`.

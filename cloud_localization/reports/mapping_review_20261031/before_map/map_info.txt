@@ -1,0 +1,10 @@
+frontend=FAST-LIO2 (IKFoM + ikd-Tree)
+loop_detection=Scan Context
+loop_verification=GICP fitness and overlap
+pose_graph=GTSAM iSAM2, wheel-odometry factors plus robust FAST-LIO2 relative factors
+lidar_mount_translation_base_footprint=-0.10,0,0.46
+lidar_mount_rpy_base_footprint=3.1415926536,0,0
+keyframes=7
+loop_closures=0
+points=708
+frame=map, anchored at the initial lidar pose

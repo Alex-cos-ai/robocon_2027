@@ -1,0 +1,30 @@
+# Export this isolated install's workspace root and the vendored GTSAM runtime
+# directory so `source install/setup.bash` is sufficient to run the launches.
+# Keep this workspace interoperable with ROS nodes launched from a standard
+# ROS-sourced terminal (for example, teleop_twist_keyboard).
+unset ROS_LOCALHOST_ONLY
+export GAZEBO_IP=127.0.0.1
+_robocon_prefix="${COLCON_CURRENT_PREFIX:-${AMENT_CURRENT_PREFIX:-}}"
+while [ -n "$_robocon_prefix" ]; do
+  if [ -d "$_robocon_prefix/vendor/install/lib" ]; then
+    CLOUD_WS_ROOT="$_robocon_prefix"
+    export CLOUD_WS_ROOT
+
+    _robocon_prepend_library() {
+      case ":${LD_LIBRARY_PATH:-}:" in
+        *":$1:"*) ;;
+        *) LD_LIBRARY_PATH="$1${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" ;;
+      esac
+    }
+    _robocon_prepend_library "$_robocon_prefix/vendor/install/lib"
+    _robocon_prepend_library "/lib/x86_64-linux-gnu"
+    export LD_LIBRARY_PATH
+    unset -f _robocon_prepend_library
+    break
+  fi
+
+  _robocon_parent="$(dirname -- "$_robocon_prefix")"
+  [ "$_robocon_parent" = "$_robocon_prefix" ] && break
+  _robocon_prefix="$_robocon_parent"
+done
+unset _robocon_prefix _robocon_parent

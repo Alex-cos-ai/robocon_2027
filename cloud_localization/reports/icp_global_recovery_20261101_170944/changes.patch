@@ -1,0 +1,561 @@
+--- before/src/robocon_cloud_localization/src/loop_closure_pgo.cpp
++++ after/src/robocon_cloud_localization/src/loop_closure_pgo.cpp
+@@ -3,6 +3,7 @@
+ #include <nav_msgs/msg/odometry.hpp>
+ #include <nav_msgs/msg/path.hpp>
+ #include <geometry_msgs/msg/transform_stamped.hpp>
++#include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
+ #include <std_srvs/srv/trigger.hpp>
+ #include <tf2_ros/transform_broadcaster.h>
+ #include <pcl/point_cloud.h>
+@@ -28,6 +29,7 @@
+ #include <filesystem>
+ #include <fstream>
+ #include <functional>
++#include <future>
+ #include <iomanip>
+ #include <limits>
+ #include <memory>
+@@ -37,6 +39,7 @@
+ #include <string>
+ #include <utility>
+ #include <vector>
++#include "global_relocalization.hpp"
+ 
+ using Cloud = pcl::PointCloud<pcl::PointXYZI>;
+ using namespace std::chrono_literals;
+@@ -85,6 +88,15 @@
+     declare_parameter("localization_initial_consistent_frames", 3);
+     declare_parameter("localization_initial_consistency_translation", 0.10);
+     declare_parameter("localization_initial_consistency_rotation", 0.05);
++    declare_parameter("localization_global_enabled", true);
++    declare_parameter("localization_global_failure_frames", 10);
++    declare_parameter("localization_global_retry_seconds", 5.0);
++    declare_parameter("localization_global_voxel", 0.25);
++    declare_parameter("localization_global_xy_step", 0.50);
++    declare_parameter("localization_global_z_step", 0.50);
++    declare_parameter("localization_global_yaw_step", 0.2617993878);
++    declare_parameter("localization_global_refine_candidates", 32);
++    declare_parameter("localization_global_ambiguity_ratio", 1.25);
+     declare_parameter("map_publish_rate", 1.0);
+     declare_parameter("initial_pose_x", 0.0);
+     declare_parameter("initial_pose_y", 0.0);
+@@ -103,7 +115,9 @@
+     for (const auto *name : {"localization_initial_max_correction",
+          "localization_initial_max_rotation_correction", "localization_initial_fitness_max",
+          "localization_initial_inlier_distance", "localization_initial_consistency_translation",
+-         "localization_initial_consistency_rotation"}) {
++         "localization_initial_consistency_rotation", "localization_global_retry_seconds",
++         "localization_global_voxel", "localization_global_xy_step", "localization_global_z_step",
++         "localization_global_yaw_step", "localization_global_ambiguity_ratio"}) {
+       const double value = get_parameter(name).as_double();
+       if (!std::isfinite(value) || value <= 0.0)
+         throw std::runtime_error(std::string(name) + " must be finite and positive");
+@@ -112,6 +126,11 @@
+     if (!std::isfinite(initial_overlap) || initial_overlap <= 0.0 || initial_overlap > 1.0 ||
+         get_parameter("localization_initial_consistent_frames").as_int() < 1)
+       throw std::runtime_error("Invalid localization initialization overlap or frame count");
++    if (get_parameter("localization_global_failure_frames").as_int()<1 ||
++        get_parameter("localization_global_refine_candidates").as_int()<1 ||
++        get_parameter("localization_global_yaw_step").as_double()>M_PI ||
++        get_parameter("localization_global_ambiguity_ratio").as_double()<1.0)
++      throw std::runtime_error("Invalid global relocalization search parameters");
+     const auto robust = gtsam::noiseModel::Robust::Create(
+       gtsam::noiseModel::mEstimator::Huber::Create(1.5),
+       gtsam::noiseModel::Diagonal::Sigmas((gtsam::Vector(6) << .04,.04,.04,.025,.025,.035).finished()));
+@@ -143,6 +162,52 @@
+     pose_pub_ = create_publisher<nav_msgs::msg::Odometry>("/localization/pose", 10);
+     save_srv_ = create_service<std_srvs::srv::Trigger>("/save_map",
+       std::bind(&LoopClosurePGO::saveMap, this, std::placeholders::_1, std::placeholders::_2));
++    initial_pose_sub_ = create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>(
++      "/initialpose", 10,
++      [this](const geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr msg) {
++        std::lock_guard<std::mutex> lock(mutex_);
++        if (mode_ != "localize") return;
++        if (msg->header.frame_id != "map") {
++          RCLCPP_WARN(get_logger(), "Ignoring /initialpose: pose must be in map frame"); return;
++        }
++        const auto &p=msg->pose.pose;
++        const auto &q=p.orientation;
++        const double norm=std::sqrt(q.x*q.x+q.y*q.y+q.z*q.z+q.w*q.w);
++        if (!std::isfinite(p.position.x) || !std::isfinite(p.position.y) ||
++            !std::isfinite(p.position.z) || !std::isfinite(norm) || norm<1e-6) return;
++        auto normalized=p;
++        normalized.orientation.x/=norm; normalized.orientation.y/=norm;
++        normalized.orientation.z/=norm; normalized.orientation.w/=norm;
++        // RViz's 2D tool supplies chassis XY/yaw, with zero height and level
++        // roll/pitch even when this FAST-LIO map's Z axis points downward.
++        // Preserve the current height/tilt estimate and apply only XY/yaw,
++        // then convert the chassis pose to the lidar registration pose.
++        const auto prior=localization_started_ ? optimized_localization_ : localization_offset_;
++        const auto base=prior.compose(lidarInBase().inverse());
++        const auto tilt=base.rotation().rpy();
++        const auto requested=fromMsg(normalized);
++        localization_offset_=gtsam::Pose3(
++          gtsam::Rot3::RzRyRx(tilt.x(),tilt.y(),requested.rotation().yaw()),
++          gtsam::Point3(p.position.x,p.position.y,base.z())).compose(lidarInBase());
++        localization_started_=false;localization_aligned_=false;
++        localization_initial_matches_=0;localization_failures_=0;localization_unstable_frames_=0;
++        global_requested_=false;
++        ++localization_generation_;
++        RCLCPP_INFO(get_logger(), "Received RViz initial base pose; restarting validated GICP initialization");
++      });
++    relocalize_srv_ = create_service<std_srvs::srv::Trigger>("/relocalize",
++      [this](const std_srvs::srv::Trigger::Request::SharedPtr,
++             const std_srvs::srv::Trigger::Response::SharedPtr res) {
++        std::lock_guard<std::mutex> lock(mutex_);
++        res->success=mode_=="localize" && get_parameter("localization_global_enabled").as_bool();
++        if (!res->success) {res->message="Global relocalization requires localize mode and localization_global_enabled";return;}
++        localization_aligned_=false;localization_initial_matches_=0;
++        localization_failures_=get_parameter("localization_global_failure_frames").as_int();
++        ++localization_generation_;
++        global_requested_=true;
++        last_global_search_=std::chrono::steady_clock::time_point{};
++        res->message="Global search requested; waiting for a scan and subsequent validation (this is not a success pose)";
++      });
+     tf_pub_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
+     const auto period = std::chrono::duration<double>(1.0 / get_parameter("map_publish_rate").as_double());
+     map_timer_ = create_wall_timer(period, std::bind(&LoopClosurePGO::publishMap, this));
+@@ -312,8 +377,73 @@
+     RCLCPP_WARN(get_logger(),"Accepted Scan Context loop %zu->%zu (descriptor=%.3f GICP=%.3fm overlap=%.0f%%); iSAM2 updated",candidate,current,best,fitness,overlap*100);
+   }
+   Eigen::Matrix4f poseMatrix(size_t i) const { return optimized_.at<gtsam::Pose3>(i).matrix().cast<float>(); }
++  void pollGlobalSearch() {
++    if (!global_search_.valid() || global_search_.wait_for(0s)!=std::future_status::ready) return;
++    robocon::GlobalResult result;
++    try {result=global_search_.get();}
++    catch (const std::exception &e) {
++      RCLCPP_ERROR(get_logger(),"Global relocalization failed: %s",e.what());return;
++    }
++    // Discard results superseded by a manual pose or successful local alignment.
++    if (global_generation_!=localization_generation_ || localization_aligned_) return;
++    if (!result.found) {
++      RCLCPP_WARN(get_logger(),"Global relocalization not accepted: %s",result.detail.c_str());return;
++    }
++    const auto mount=lidarInBase();
++    const auto motion=mount.inverse().compose(global_wheel_start_.between(latest_wheel_)).compose(mount);
++    optimized_localization_=gtsam::Pose3(Eigen::Matrix4d(result.pose.cast<double>())).compose(motion);
++    localization_wheel_previous_=latest_wheel_;
++    localization_started_=true;localization_initial_matches_=0;localization_failures_=0;
++    localization_unstable_frames_=0;
++    RCLCPP_INFO(get_logger(),
++      "Global relocalization candidate: xyz=[%.3f %.3f %.3f] yaw=%.3f rad fitness=%.5f m^2 "
++      "overlap=%.1f%%; %s; validating on fresh scans",
++      optimized_localization_.x(),optimized_localization_.y(),optimized_localization_.z(),
++      optimized_localization_.rotation().yaw(),result.fitness,result.overlap*100.0,result.detail.c_str());
++  }
++  void startGlobalSearch(const Cloud::Ptr &cloud,const gtsam::Pose3 &predicted) {
++    if (global_search_.valid() || !get_parameter("localization_global_enabled").as_bool()) return;
++    const auto steady=std::chrono::steady_clock::now();
++    if (last_global_search_!=std::chrono::steady_clock::time_point{} &&
++        std::chrono::duration<double>(steady-last_global_search_).count()<
++          get_parameter("localization_global_retry_seconds").as_double()) return;
++    last_global_search_=steady;
++    robocon::GlobalOptions options;
++    options.voxel=get_parameter("localization_global_voxel").as_double();
++    options.xy_step=get_parameter("localization_global_xy_step").as_double();
++    options.z_step=get_parameter("localization_global_z_step").as_double();
++    options.yaw_step=get_parameter("localization_global_yaw_step").as_double();
++    options.refine_candidates=get_parameter("localization_global_refine_candidates").as_int();
++    options.fitness_max=get_parameter("localization_initial_fitness_max").as_double();
++    options.inlier_distance=get_parameter("localization_initial_inlier_distance").as_double();
++    options.overlap_min=get_parameter("localization_initial_inlier_ratio_min").as_double();
++    options.ambiguity_ratio=get_parameter("localization_global_ambiguity_ratio").as_double();
++    global_generation_=localization_generation_;global_wheel_start_=latest_wheel_;
++    global_requested_=false;
++    const Cloud::ConstPtr target=map_cloud_,source=cloud;
++    const Eigen::Matrix4f guess=predicted.matrix().cast<float>();
++    RCLCPP_WARN(get_logger(),"Starting global XYZ/yaw map search after %d rejected scans; local TF/map publishing continues",
++      localization_failures_);
++    global_search_=std::async(std::launch::async,[source,target,guess,options] {
++      return robocon::globalRelocalize(source,target,guess,options);
++    });
++  }
++  void localizationFailure(const Cloud::Ptr &cloud,const gtsam::Pose3 &predicted,
++                           const builtin_interfaces::msg::Time &stamp) {
++    optimized_localization_=predicted;localization_initial_matches_=0;++localization_failures_;
++    const int failures=get_parameter("localization_global_failure_frames").as_int();
++    if (localization_failures_>=failures) {
++      if (localization_aligned_) {
++        localization_aligned_=false;++localization_generation_;
++        RCLCPP_WARN(get_logger(),"GICP tracking lost; entering relocalization");
++      }
++      startGlobalSearch(cloud,predicted);
++    }
++    publishLocalizationPose(stamp,1.0);
++  }
+   void localize(const Cloud::Ptr &cloud,const builtin_interfaces::msg::Time &stamp) {
+     if(map_cloud_->empty())return;
++    pollGlobalSearch();
+     if(!localization_started_){
+       localization_wheel_previous_=latest_wheel_;
+       optimized_localization_=localization_offset_;
+@@ -327,6 +457,7 @@
+     localization_wheel_previous_=latest_wheel_;
+     const auto lidar_motion=lidar_in_base.inverse().compose(base_motion).compose(lidar_in_base);
+     const auto predicted=optimized_localization_.compose(lidar_motion);
++    if (global_requested_) startGlobalSearch(cloud,predicted);
+     const bool initializing = !localization_aligned_;
+     const char *stage = initializing ? "initializing" : "tracking";
+ 
+@@ -346,8 +477,7 @@
+       RCLCPP_INFO_THROTTLE(get_logger(),*get_clock(),2000,
+         "GICP %s rejected: converged=%s fitness=%.5f m^2 limit=%.5f m^2 source=%zu map=%zu; using wheel prediction",
+         stage,gicp.hasConverged()?"true":"false",fitness,fitness_limit,cloud->size(),map_cloud_->size());
+-      optimized_localization_=predicted;
+-      publishLocalizationPose(stamp,1.0);
++      localizationFailure(cloud,predicted,stamp);
+       return;
+     }
+     const gtsam::Pose3 icp_pose(Eigen::Matrix4d(gicp.getFinalTransformation().cast<double>()));
+@@ -372,11 +502,10 @@
+       localization_initial_matches_ = 0;
+       RCLCPP_INFO_THROTTLE(get_logger(),*get_clock(),2000,
+         "GICP %s correction rejected: exceeds correction limits; using wheel prediction", stage);
+-      optimized_localization_=predicted;
+-      publishLocalizationPose(stamp,1.0);
++      localizationFailure(cloud,predicted,stamp);
+       return;
+     }
+-    if (initializing) {
++    {
+       // Low fitness alone can come from a small patch of floor. Require a
+       // substantial fraction of the WHOLE scan to agree with the target.
+       pcl::search::KdTree<pcl::PointXYZI> tree;
+@@ -394,11 +523,19 @@
+       if (overlap < get_parameter("localization_initial_inlier_ratio_min").as_double()) {
+         localization_initial_matches_ = 0;
+         RCLCPP_INFO_THROTTLE(get_logger(),*get_clock(),2000,
+-          "GICP initialization rejected: overlap=%.1f%% below %.1f%% within %.2f m; using wheel prediction",
+-          overlap * 100.0, get_parameter("localization_initial_inlier_ratio_min").as_double() * 100.0,
++          "GICP %s rejected: overlap=%.1f%% below %.1f%% within %.2f m; using wheel prediction",
++          stage, overlap * 100.0, get_parameter("localization_initial_inlier_ratio_min").as_double() * 100.0,
+           distance);
+-        optimized_localization_ = predicted;
+-        publishLocalizationPose(stamp, 1.0);
++        localizationFailure(cloud,predicted,stamp);
++        return;
++      }
++      // Check overlap during tracking too: a tiny floor patch can otherwise
++      // produce a low fitness while localization has actually been lost.
++      localization_failures_=0;
++      if (!initializing) {
++        const double weight=std::clamp(get_parameter("localization_icp_weight").as_double(),0.0,1.0);
++        optimized_localization_=predicted.retract(weight*correction);
++        publishLocalizationPose(stamp,fitness);
+         return;
+       }
+       bool consistent = false;
+@@ -410,11 +547,14 @@
+           get_parameter("localization_initial_consistency_translation").as_double() &&
+           gtsam::Rot3::Logmap(change.rotation()).norm() <=
+           get_parameter("localization_initial_consistency_rotation").as_double();
++        if (!consistent) ++localization_unstable_frames_;
+       }
+       localization_initial_matches_ = consistent ? localization_initial_matches_ + 1 : 1;
+       localization_initial_candidate_ = icp_pose;
+       const int required = get_parameter("localization_initial_consistent_frames").as_int();
+       if (localization_initial_matches_ < required) {
++        if (localization_unstable_frames_>=get_parameter("localization_global_failure_frames").as_int())
++          startGlobalSearch(cloud,predicted);
+         RCLCPP_INFO_THROTTLE(get_logger(),*get_clock(),2000,
+           "GICP initialization pending: %d/%d consistent scans, overlap=%.1f%%",
+           localization_initial_matches_,required,overlap*100.0);
+@@ -426,6 +566,8 @@
+       // here would leave an initial offset above the tracking correction gate.
+       optimized_localization_ = icp_pose;
+       localization_aligned_ = true;
++      localization_unstable_frames_=0;
++      ++localization_generation_;
+       const auto rpy = icp_pose.rotation().rpy();
+       RCLCPP_INFO(get_logger(),
+         "GICP initialized: map_pose_xyz=[%.4f %.4f %.4f] m rpy=[%.6f %.6f %.6f] rad "
+@@ -436,9 +578,6 @@
+       publishLocalizationPose(stamp, fitness);
+       return;
+     }
+-    const double icp_weight=std::clamp(get_parameter("localization_icp_weight").as_double(),0.0,1.0);
+-    optimized_localization_=predicted.retract(icp_weight*correction);
+-    publishLocalizationPose(stamp,fitness);
+   }
+   void publishLocalizationPose(const builtin_interfaces::msg::Time &stamp,double variance) {
+     nav_msgs::msg::Odometry pose; pose.header.stamp=stamp; pose.header.frame_id="map"; pose.child_frame_id="mid360_link";
+@@ -564,16 +703,25 @@
+   bool localization_aligned_ = false;
+   int localization_initial_matches_ = 0;
+   gtsam::Pose3 localization_initial_candidate_;
++  int localization_failures_=0;
++  int localization_unstable_frames_=0;
++  bool global_requested_=false;
++  size_t localization_generation_=0,global_generation_=0;
++  gtsam::Pose3 global_wheel_start_;
++  std::chrono::steady_clock::time_point last_global_search_;
++  std::future<robocon::GlobalResult> global_search_;
+   std::vector<Keyframe> keyframes_;Cloud::Ptr map_cloud_{new Cloud};
+   gtsam::NonlinearFactorGraph graph_;gtsam::Values initials_,optimized_;
+   std::unique_ptr<gtsam::ISAM2> isam_;gtsam::SharedNoiseModel loop_noise_,wheel_noise_,lio_noise_,prior_noise_;
+   builtin_interfaces::msg::Time last_keyframe_stamp_;
+   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_sub_;
++  rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr initial_pose_sub_;
+   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr lio_odom_sub_,wheel_odom_sub_;
+   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr map_pub_;
+   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr path_pub_;
+   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pose_pub_;
+   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr save_srv_;
++  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr relocalize_srv_;
+   std::unique_ptr<tf2_ros::TransformBroadcaster> tf_pub_;rclcpp::TimerBase::SharedPtr map_timer_;
+ };
+ 
+--- before/src/robocon_cloud_localization/config/localization.yaml
++++ after/src/robocon_cloud_localization/config/localization.yaml
+@@ -31,4 +31,16 @@
+     localization_initial_consistent_frames: 3
+     localization_initial_consistency_translation: 0.10  # m between candidates
+     localization_initial_consistency_rotation: 0.05  # rad between candidates
++    # Local GICP cannot recover from a distant/wrong initial guess. After
++    # repeated failures search the map bounds in XYZ and all yaw angles in a
++    # background worker, then verify the candidate on fresh consecutive scans.
++    localization_global_enabled: true
++    localization_global_failure_frames: 10
++    localization_global_retry_seconds: 5.0
++    localization_global_voxel: 0.25  # coarse distance grid, m
++    localization_global_xy_step: 0.50  # m
++    localization_global_z_step: 0.50  # m
++    localization_global_yaw_step: 0.2617993878  # 15 degrees, radians
++    localization_global_refine_candidates: 32
++    localization_global_ambiguity_ratio: 1.25  # reject similarly good distinct locations
+     map_publish_rate: 1.0
+--- before/src/robocon_cloud_localization/CMakeLists.txt
++++ after/src/robocon_cloud_localization/CMakeLists.txt
+@@ -33,7 +33,7 @@
+ target_link_directories(mid360_sim PRIVATE ${GAZEBO_LIBRARY_DIRS})
+ target_link_libraries(mid360_sim ${GAZEBO_LIBRARIES})
+ ament_target_dependencies(mid360_sim gazebo_ros rclcpp sensor_msgs geometry_msgs nav_msgs)
+-add_executable(loop_closure_pgo src/loop_closure_pgo.cpp)
++add_executable(loop_closure_pgo src/loop_closure_pgo.cpp src/global_relocalization.cpp)
+ target_include_directories(loop_closure_pgo PRIVATE ${PCL_INCLUDE_DIRS})
+ target_link_libraries(loop_closure_pgo ${PCL_LIBRARIES} gtsam)
+ ament_target_dependencies(loop_closure_pgo rclcpp sensor_msgs nav_msgs geometry_msgs std_srvs tf2_ros pcl_conversions)
+--- before/README.md
++++ after/README.md
+@@ -93,7 +93,17 @@
+ Localization now has two stages, configured in `src/robocon_cloud_localization/config/localization.yaml`:
+ 
+ - Initialization allows up to 1.0 m / 0.35 rad correction. It requires fitness <= 0.01 m^2, at least 60% of all scan points within 0.20 m of the target, and 3 consecutive candidates agreeing within 0.10 m / 0.05 rad after wheel-motion compensation. The validated initial alignment is applied in full once.
+-- Tracking restores the 0.35 m / 0.25 rad correction limits and blends accepted GICP corrections using `localization_icp_weight`. Failure during tracking keeps wheel prediction; it does not automatically enable the wider initialization limits again.
++- Tracking restores the 0.35 m / 0.25 rad correction limits and blends accepted GICP corrections using `localization_icp_weight`. Rejected scans keep wheel prediction. After `localization_global_failure_frames` consecutive failures (default 10), tracking is marked lost and global recovery starts.
++
++If a starting guess is several metres or a large yaw angle away, local GICP has no way to search the rest of the map. Global recovery now searches XYZ across map bounds (with a 1 m margin) and yaw over a full circle in a background worker. A coarse 3D distance grid ranks candidates, GICP refines distinct candidates, and full-scan overlap and mean squared distance filter the results. Distinct poses with similarly good scores are rejected as ambiguous. A successful candidate is compensated for wheel motion during the search and must still pass the normal three-scan initialization check. Repeated failures retry after `localization_global_retry_seconds` (default 5 s). Grid work is bounded; large maps automatically use a coarser XY search, and grids above four million cells require increasing `localization_global_voxel`.
++
++The `localization_global_*` parameters are in `config/localization.yaml`. The default search is intended for this small field, assumes the gravity/mount roll and pitch are approximately known, and does not guarantee recovery in repetitive or featureless geometry. It uses the PCD, live scan and wheel motion, not Gazebo ground truth. Trigger a new search manually with:
++
++```bash
++ros2 service call /relocalize std_srvs/srv/Trigger '{}'
++```
++
++The service acknowledges a search request, not a completed localization. Watch for `Global relocalization candidate` and then `GICP initialized`. In RViz, **2D Pose Estimate** now sends a new chassis XY/yaw estimate on `/initialpose` in frame `map`. The receiver preserves its height/tilt estimate and converts chassis XY/yaw to the lidar pose; this matters for downward-facing sensors and FAST-LIO maps with downward Z. Height/tilt can also be supplied with the `initial_pose_z/roll/pitch` launch arguments on restart. A manual pose reset invalidates any earlier asynchronous search result.
+ 
+ `GICP initializing/tracking candidate` logs include `map_delta_xyz` in **map axes**, relative rotation in degrees, and the active correction limits. `GICP initialized` prints the accepted full map pose, with rotation in **radians**, for reuse as an initial guess. PCL fitness is mean squared nearest-neighbor distance (m^2), not metres. A low score alone does not guarantee the correct field location on repetitive geometry; the initial guess must still be near the intended location.
+ 
+--- /dev/null
++++ src/robocon_cloud_localization/src/global_relocalization.cpp
+@@ -0,0 +1,162 @@
++#include "global_relocalization.hpp"
++#include <pcl/common/common.h>
++#include <pcl/filters/voxel_grid.h>
++#include <pcl/registration/gicp.h>
++#include <pcl/search/kdtree.h>
++#include <Eigen/Geometry>
++#include <algorithm>
++#include <cmath>
++#include <limits>
++#include <sstream>
++#include <vector>
++
++namespace robocon {
++namespace {
++RegistrationCloud::Ptr filtered(const RegistrationCloud::ConstPtr &input, float leaf) {
++  RegistrationCloud::Ptr out(new RegistrationCloud);
++  pcl::VoxelGrid<pcl::PointXYZI> filter;
++  filter.setInputCloud(input); filter.setLeafSize(leaf, leaf, leaf); filter.filter(*out);
++  return out;
++}
++struct Candidate {
++  double score;
++  Eigen::Matrix4f pose;
++};
++double yaw(const Eigen::Matrix4f &pose) { return std::atan2(pose(1,0),pose(0,0)); }
++bool distinct(const Eigen::Matrix4f &a, const Eigen::Matrix4f &b) {
++  return (a.block<3,1>(0,3)-b.block<3,1>(0,3)).norm() > 0.75 ||
++    std::abs(std::remainder(yaw(a)-yaw(b), 2*M_PI)) > 0.35;
++}
++}  // namespace
++
++GlobalResult globalRelocalize(const RegistrationCloud::ConstPtr &scan,
++                             const RegistrationCloud::ConstPtr &map,
++                             const Eigen::Matrix4f &guess, const GlobalOptions &opt) {
++  GlobalResult result;
++  auto target = filtered(map, opt.voxel);
++  auto source = filtered(scan, opt.voxel);
++  if (target->size()<50 || source->size()<50) {
++    result.detail="too few points for global registration"; return result;
++  }
++  pcl::PointXYZI lo,hi; pcl::getMinMax3D(*target,lo,hi);
++  const float cell=opt.voxel, radius=0.90f, max_cost=radius*radius;
++  const Eigen::Vector3f origin(lo.x-radius,lo.y-radius,lo.z-radius);
++  const Eigen::Vector3i dims(
++    int(std::ceil((hi.x-lo.x+2*radius)/cell))+1,
++    int(std::ceil((hi.y-lo.y+2*radius)/cell))+1,
++    int(std::ceil((hi.z-lo.z+2*radius)/cell))+1);
++  const int64_t cells=int64_t(dims.x())*dims.y()*dims.z();
++  if(cells<=0 || cells>4000000) {
++    result.detail="map exceeds global search grid budget; increase localization_global_voxel";
++    return result;
++  }
++  std::vector<float> distance(cells,max_cost);
++  const auto index=[&](int x,int y,int z){return (z*dims.y()+y)*dims.x()+x;};
++  const int spread=int(std::ceil(radius/cell));
++  for(const auto &p:target->points) {
++    const Eigen::Vector3f v(p.x,p.y,p.z);
++    const Eigen::Vector3i center=((v-origin)/cell).array().floor().cast<int>();
++    for(int z=std::max(0,center.z()-spread);z<=std::min(dims.z()-1,center.z()+spread);++z)
++      for(int y=std::max(0,center.y()-spread);y<=std::min(dims.y()-1,center.y()+spread);++y)
++        for(int x=std::max(0,center.x()-spread);x<=std::min(dims.x()-1,center.x()+spread);++x) {
++          const Eigen::Vector3f c=origin+cell*Eigen::Vector3f(x+.5f,y+.5f,z+.5f);
++          auto &d=distance[index(x,y,z)]; d=std::min(d,(c-v).squaredNorm());
++        }
++  }
++  // Sample spatially downsampled points deterministically, not the original
++  // ray ordering. Equal voxel weighting reduces domination by dense floor hits.
++  std::vector<Eigen::Vector3f> points;
++  const size_t count=std::min<size_t>(source->size(),256);
++  for(size_t i=0;i<count;++i) {
++    const auto &p=source->points[i*source->size()/count];
++    points.emplace_back(p.x,p.y,p.z);
++  }
++  // Preserve the initial roll/pitch while searching a full circle of yaw.
++  const Eigen::Matrix3f tilt=Eigen::AngleAxisf(-yaw(guess),Eigen::Vector3f::UnitZ())*
++    guess.block<3,3>(0,0);
++  const double z_lo=lo.z-1.0, z_hi=hi.z+1.0;
++  double step=opt.xy_step;
++  const double estimate=(hi.x-lo.x+2.0)/step*(hi.y-lo.y+2.0)/step*
++    ((z_hi-z_lo)/opt.z_step+1)*(2*M_PI/opt.yaw_step+1);
++  // Bound search work on unusually large maps instead of blocking indefinitely.
++  if(estimate>250000) step*=std::sqrt(estimate/250000);
++  std::vector<Candidate> candidates;
++  candidates.reserve(256);
++  size_t hypotheses=0;
++  for(double angle=-M_PI;angle<M_PI-1e-6;angle+=opt.yaw_step) {
++    const Eigen::Matrix3f rot=Eigen::AngleAxisf(angle,Eigen::Vector3f::UnitZ())*tilt;
++    std::vector<Eigen::Vector3f> rotated;rotated.reserve(points.size());
++    for(const auto &p:points) rotated.push_back(rot*p);
++    for(double z=z_lo;z<=z_hi;z+=opt.z_step)
++      for(double y=lo.y-1.0;y<=hi.y+1.0;y+=step)
++        for(double x=lo.x-1.0;x<=hi.x+1.0;x+=step) {
++          ++hypotheses;
++          const Eigen::Vector3f t(x,y,z);
++          double cost=0;
++          for(const auto &p:rotated) {
++            const Eigen::Vector3i c=((p+t-origin)/cell).array().floor().cast<int>();
++            cost+=(c.x()<0 || c.y()<0 || c.z()<0 || c.x()>=dims.x() ||
++              c.y()>=dims.y() || c.z()>=dims.z()) ? max_cost : distance[index(c.x(),c.y(),c.z())];
++          }
++          cost/=points.size();
++          if(candidates.size()>=192 && cost>=candidates.back().score) continue;
++          Candidate c{cost,Eigen::Matrix4f::Identity()};
++          c.pose.block<3,3>(0,0)=rot;c.pose.block<3,1>(0,3)=t;
++          auto at=std::lower_bound(candidates.begin(),candidates.end(),cost,
++            [](const Candidate &a,double score){return a.score<score;});
++          candidates.insert(at,c);
++          if(candidates.size()>192)candidates.pop_back();
++        }
++  }
++  // Retain candidates in different basins rather than spending all refinements
++  // on neighbors around a single grid point.
++  std::vector<Candidate> seeds;
++  for(const auto &candidate:candidates) {
++    if(std::all_of(seeds.begin(),seeds.end(),[&](const Candidate &s){return distinct(candidate.pose,s.pose);}))
++      seeds.push_back(candidate);
++    if(seeds.size()>=static_cast<size_t>(opt.refine_candidates)) break;
++  }
++  pcl::search::KdTree<pcl::PointXYZI> tree;tree.setInputCloud(map);
++  auto refine_source=filtered(scan,0.12f);
++  std::vector<Candidate> accepted;
++  std::vector<double> overlaps;
++  for(const auto &seed:seeds) {
++    pcl::GeneralizedIterativeClosestPoint<pcl::PointXYZI,pcl::PointXYZI> gicp;
++    gicp.setMaximumIterations(45);gicp.setMaxCorrespondenceDistance(0.90);
++    gicp.setTransformationEpsilon(1e-5);gicp.setEuclideanFitnessEpsilon(1e-5);
++    gicp.setInputSource(refine_source);gicp.setInputTarget(map);
++    RegistrationCloud aligned;gicp.align(aligned,seed.pose);
++    if(!gicp.hasConverged() || !gicp.getFinalTransformation().allFinite())continue;
++    // Score ALL points, counting misses. Fitness on just the nearest subset
++    // otherwise lets a small overlapping floor patch look like a good match.
++    double squared=0;size_t inliers=0;
++    std::vector<int> ids(1);std::vector<float> distances(1);
++    for(const auto &p:aligned.points) {
++      if(tree.nearestKSearch(p,1,ids,distances)>0) {
++        squared+=std::min<double>(distances[0],max_cost);
++        if(distances[0]<=opt.inlier_distance*opt.inlier_distance)++inliers;
++      } else squared+=max_cost;
++    }
++    const double score=squared/aligned.size(),overlap=double(inliers)/aligned.size();
++    if(!std::isfinite(score) || score>opt.fitness_max || overlap<opt.overlap_min)continue;
++    accepted.push_back({score,gicp.getFinalTransformation()});overlaps.push_back(overlap);
++  }
++  if(accepted.empty()) {
++    result.detail="no validated global candidate ("+std::to_string(hypotheses)+" grid poses, "+
++      std::to_string(seeds.size())+" GICP refinements)";return result;
++  }
++  const size_t best=std::min_element(accepted.begin(),accepted.end(),
++    [](const Candidate &a,const Candidate &b){return a.score<b.score;})-accepted.begin();
++  for(size_t i=0;i<accepted.size();++i) {
++    if(i!=best && distinct(accepted[i].pose,accepted[best].pose) &&
++       accepted[i].score<=accepted[best].score*opt.ambiguity_ratio+1e-5) {
++      result.detail="ambiguous global matches; use RViz 2D Pose Estimate to identify the field location";
++      return result;
++    }
++  }
++  result.found=true;result.pose=accepted[best].pose;result.fitness=accepted[best].score;
++  result.overlap=overlaps[best];
++  result.detail=std::to_string(hypotheses)+" grid poses, "+std::to_string(seeds.size())+" GICP refinements";
++  return result;
++}
++}  // namespace robocon
+--- /dev/null
++++ src/robocon_cloud_localization/src/global_relocalization.hpp
+@@ -0,0 +1,34 @@
++#pragma once
++
++#include <pcl/point_cloud.h>
++#include <pcl/point_types.h>
++#include <Eigen/Core>
++#include <string>
++
++namespace robocon {
++using RegistrationCloud = pcl::PointCloud<pcl::PointXYZI>;
++struct GlobalOptions {
++  double voxel = 0.25;
++  double xy_step = 0.50;
++  double z_step = 0.50;
++  double yaw_step = 0.2617993878;
++  int refine_candidates = 32;
++  double fitness_max = 0.01;
++  double inlier_distance = 0.20;
++  double overlap_min = 0.60;
++  double ambiguity_ratio = 1.25;
++};
++struct GlobalResult {
++  bool found = false;
++  Eigen::Matrix4f pose = Eigen::Matrix4f::Identity();
++  double fitness = 0.0;
++  double overlap = 0.0;
++  std::string detail;
++};
++// Search XYZ and yaw across the target bounds. Roll/pitch remain near the
++// supplied gravity/mount estimate; GICP refines all six degrees of freedom.
++GlobalResult globalRelocalize(const RegistrationCloud::ConstPtr &scan,
++                             const RegistrationCloud::ConstPtr &map,
++                             const Eigen::Matrix4f &guess,
++                             const GlobalOptions &options);
++}  // namespace robocon

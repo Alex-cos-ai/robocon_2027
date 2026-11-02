@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<sdf version="1.6">
+  <world name="robocon_world">
+    <gravity>0 0 -9.81</gravity>
+    <physics name="default" type="ode">
+      <max_step_size>0.002</max_step_size>
+      <real_time_update_rate>500</real_time_update_rate>
+    </physics>
+    <scene><ambient>0.7 0.7 0.7 1</ambient><shadows>false</shadows></scene>
+    <gui><camera name="user_camera"><pose>10 -12 11 0 0.65 2.45</pose></camera></gui>
+    <light type="directional" name="sun">
+      <cast_shadows>true</cast_shadows>
+      <pose>0 0 10 0 0 0</pose>
+      <diffuse>0.8 0.8 0.8 1</diffuse>
+      <specular>0.2 0.2 0.2 1</specular>
+      <direction>0.1 0.1 -1</direction>
+    </light>
+    <include>
+      <uri>model://robocon_ground</uri>
+      <pose>0 0 0 0 0 0</pose>
+    </include>
+    <include>
+      <uri>model://robocon_tops</uri>
+      <pose>0 0 0 0 0 0</pose>
+    </include>
+  </world>
+</sdf>

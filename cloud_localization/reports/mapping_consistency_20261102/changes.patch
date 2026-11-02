@@ -1,0 +1,796 @@
+--- a/README.md
++++ b/README.md
+@@ -61,7 +61,9 @@
+ ./scripts/save_map.sh
+ ```
+ 
+-The `mapping.launch.py` entry point in `src/robocon_cloud_localization/launch/` starts the shared `simulation.launch.py` with `mode:=map`. The tested route starts at `(-3.1, 1.3)` and repeats a 0.8 m square so the loop detector sees revisited scans. For a different route, set `initial_x` and `initial_y` to a clear point on the field. Keyframes retain each local MID360 ray scan; Scan Context proposes revisits, GICP must pass fitness and inlier-overlap gates, and accepted loops update iSAM2. `/localization/optimized_map` and `/localization/optimized_path` show optimized outputs. `/save_map` writes `maps/fastlio_mid360_downward/map.pcd`, one local-cloud PCD per optimized keyframe, optimized poses and `map_info.txt`.
++The `mapping.launch.py` entry point in `src/robocon_cloud_localization/launch/` starts the shared `simulation.launch.py` with `mode:=map`. Set `initial_x` and `initial_y` to a clear point on the field; route completion depends on collision geometry. Keyframes now retain FAST-LIO's local body scans (`/fast_lio/cloud_registered_body`) and use wheel/LIO poses interpolated at the scan timestamp. Mapping rejects scans without a valid pose bracket instead of attaching the newest odometry pose. A robust local scan-to-submap GICP factor corrects small registration errors before a full revisit. Scan Context proposes historical candidates within the predicted neighborhood; historical-submap GICP must pass all-point MSE, tight 0.20 m overlap, bounded correction and consecutive-keyframe confirmation before adding a loop factor. Accepted loops trigger additional iSAM2 updates, and all historical keyframes are transformed by their updated poses for publication/export. `/localization/optimized_map` and `/localization/optimized_path` show optimized outputs. `/save_map` writes `maps/fastlio_mid360_downward/map.pcd`, one local-cloud PCD per optimized keyframe, optimized poses and `map_info.txt`.
++
++Mapping parameters and diagnostic logs are described in [建图漂移与回环检查](docs/mapping_consistency.md). Global localization backends (`grid_gicp`/`bbs_*_gicp`) apply to saved-map localization, while mapping uses the local registration and loop-closure path described here.
+ 
+ FAST-LIO also saves its frontend point cloud independently of the pose-graph
+ map above. In `src/fast_lio_ros2/config/mid360_sim.yaml`, enable
+@@ -79,6 +81,9 @@
+ 
+ Use `/save_map` (or `./scripts/save_map.sh`) for the separate optimized
+ pose-graph map in `maps/fastlio_mid360_downward/map.pcd`.
++Use `save_fastlio_pcd:=false` when launching mapping to disable the separate
++frontend save. Use `map_directory:=/absolute/output/bundle` to choose the
++optimized `/save_map` output directory; it does not change the frontend path.
+ 
+ ## Relocalize against a saved PCD
+ 
+--- a/src/robocon_cloud_localization/CMakeLists.txt
++++ b/src/robocon_cloud_localization/CMakeLists.txt
+@@ -34,7 +34,7 @@
+ target_link_libraries(mid360_sim ${GAZEBO_LIBRARIES})
+ ament_target_dependencies(mid360_sim gazebo_ros rclcpp sensor_msgs geometry_msgs nav_msgs)
+ include(cmake/3d_bbs.cmake)
+-add_library(robocon_global_registration STATIC src/global_relocalization.cpp src/bbs_relocalization.cpp)
++add_library(robocon_global_registration STATIC src/global_relocalization.cpp src/bbs_relocalization.cpp src/mapping_registration.cpp)
+ target_include_directories(robocon_global_registration PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src ${PCL_INCLUDE_DIRS})
+ target_link_libraries(robocon_global_registration PUBLIC ${PCL_LIBRARIES} robocon_bbs_cpu)
+ if(TARGET robocon_bbs_gpu)
+@@ -49,6 +49,9 @@
+   add_executable(registration_contract_test test/registration_contract_test.cpp)
+   target_link_libraries(registration_contract_test robocon_global_registration)
+   add_test(NAME registration_contract_cpu COMMAND registration_contract_test bbs_cpu_gicp)
++  add_executable(mapping_registration_test test/mapping_registration_test.cpp)
++  target_link_libraries(mapping_registration_test robocon_global_registration gtsam)
++  add_test(NAME mapping_registration COMMAND mapping_registration_test)
+   if(TARGET robocon_bbs_gpu)
+     add_test(NAME registration_contract_gpu COMMAND registration_contract_test bbs_gpu_gicp)
+   endif()
+--- a/src/robocon_cloud_localization/config/localization.yaml
++++ b/src/robocon_cloud_localization/config/localization.yaml
+@@ -22,9 +22,29 @@
+     loop_separation: 12 # 循环闭合的最小距离（当前关键帧只与至少 12 个关键帧之前的帧进行回环匹配）
+     loop_similarity: 0.42 # 循环闭合的相似度阈值，得分越低表示越相似
+     gicp_max_correspondence: 0.8 # GICP最大对应点距离
+-    # 下面的参数是 GICP 的收敛条件，只有满足 fitness ≤ 0.10 且 inlier_ratio ≥ 0.35才会收敛回环
+-    loop_fitness_max: 0.10 # 循环闭合的最大适应度，配准的均方距离（通常单位 m²）
+-    loop_inlier_ratio_min: 0.35 # 循环闭合的最小内点比例
++    # 以下是配准后的验收门限，不是 GICP 数值迭代的收敛条件。
++    loop_fitness_max: 0.01 # 全点截断均方距离，m²，包括没有匹配上的点
++    loop_inlier_distance: 0.20 # 内点距离，m；独立于上面的 0.8 m 搜索对应距离
++    loop_inlier_ratio_min: 0.70
++    loop_search_radius: 2.5 # 图优化预测位置附近的历史候选，m
++    loop_min_time: 15.0 # 与历史候选间隔的最短秒数
++    loop_candidates: 3 # 最多尝试的 Scan Context 候选
++    loop_submap_frames: 2 # 历史候选前后各融合几帧，排除近期扫描
++    loop_max_correction: 1.0 # 相对图预测允许的最大修正，m
++    loop_max_rotation: 0.35 # rad
++    loop_consistent_frames: 2 # 不同关键帧连续验证通过才添加回环约束
++    loop_consistency_translation: 0.20 # 轮速补偿后候选位姿的一致性，m
++    loop_consistency_rotation: 0.10 # rad
++    loop_min_interval: 3.0 # 两个已接受回环约束之间的最短秒数
++    loop_ambiguity_ratio: 1.25 # 不同位置却有接近误差的候选，拒绝此次回环
++    # 建图改用 FAST-LIO 去畸变局部扫描，按扫描时间插值匹配里程计。
++    mapping_sync_max_gap: 0.20 # 允许插值的最大里程计间隔，s
++    mapping_local_registration: true # 回环前也进行局部扫描到子图配准
++    mapping_local_submap_frames: 5
++    mapping_local_fitness_max: 0.01 # 全点 MSE，m²
++    mapping_local_inlier_ratio_min: 0.70
++    mapping_local_max_correction: 0.30 # 单关键帧修正上限，m
++    mapping_local_max_rotation: 0.15 # rad
+ 
+     localization_fitness_max: 0.35  # PCL mean squared distance, m^2
+     localization_icp_weight: 0.10 
+@@ -59,7 +79,7 @@
+     localization_global_xy_step: 0.50  # m 全局搜索的离散化步长
+     localization_global_z_step: 0.50  # m
+     localization_global_yaw_step: 0.2617993878  # 15 degrees, radians
+-    localization_global_refine_candidates: 32 #从 BBS 搜索结果中选取前 32 个候选，逐一用 GICP 精化并验证
++    localization_global_refine_candidates: 32 # 仅 V1 网格搜索；BBS 的近最佳候选集合最多 8 个
+     localization_global_ambiguity_ratio: 1.25  # reject similarly good distinct locations
+     
+     
+--- a/src/robocon_cloud_localization/launch/mapping.launch.py
++++ b/src/robocon_cloud_localization/launch/mapping.launch.py
+@@ -12,6 +12,8 @@
+     simulation = share / 'launch' / 'simulation.launch.py'
+     return LaunchDescription([
+         DeclareLaunchArgument('gui', default_value='true', description='Show Gazebo and RViz'),
++        DeclareLaunchArgument('save_fastlio_pcd', default_value='true', choices=['true', 'false'],
++                              description='Save raw frontend PCD independently of optimized /save_map'),
+         DeclareLaunchArgument(
+             'world',
+             default_value=str(share / 'worlds' / 'robocon_track.world'),
+@@ -25,6 +27,7 @@
+             launch_arguments={
+                 'mode': 'map',
+                 'gui': LaunchConfiguration('gui'),
++                'save_fastlio_pcd': LaunchConfiguration('save_fastlio_pcd'),
+                 'world': LaunchConfiguration('world'),
+                 'initial_x': LaunchConfiguration('initial_x'),
+                 'initial_y': LaunchConfiguration('initial_y'),
+--- a/src/robocon_cloud_localization/launch/simulation.launch.py
++++ b/src/robocon_cloud_localization/launch/simulation.launch.py
+@@ -167,7 +167,7 @@
+                     # path, so allow map saving only during mapping sessions.
+                     "pcd_save": {
+                         "pcd_save_en": ParameterValue(
+-                            PythonExpression(["'", mode, "' == 'map'"]),
++                            PythonExpression(["'", mode, "' == 'map' and '", LaunchConfiguration("save_fastlio_pcd"), "'.lower() == 'true'"]),
+                             value_type=bool,
+                         ),
+                     },
+@@ -183,7 +183,7 @@
+                 {
+                     "mode": mode,
+                     "localization_global_backend": LaunchConfiguration("relocalization_backend"),
+-                    "map_directory": str(root / "maps" / "fastlio_mid360_downward"),
++                    "map_directory": LaunchConfiguration("map_directory"),
+                     "map_file": map_file,
+                     "initial_pose_x": ParameterValue(guess_x, value_type=float),
+                     "initial_pose_y": ParameterValue(guess_y, value_type=float),
+@@ -231,6 +231,10 @@
+             # from a normal ROS-sourced terminal.
+             UnsetEnvironmentVariable(name="ROS_LOCALHOST_ONLY"),
+             DeclareLaunchArgument("mode", default_value="map", description="map or localize"),
++            DeclareLaunchArgument("save_fastlio_pcd", default_value="true", choices=["true", "false"],
++                                  description="Save the separate raw FAST-LIO PCD in mapping mode"),
++            DeclareLaunchArgument("map_directory", default_value=str(root / "maps" / "fastlio_mid360_downward"),
++                                  description="Output bundle directory for /save_map (optimized map)"),
+             DeclareLaunchArgument("relocalization_backend", default_value="bbs_gpu_gicp",
+                                   choices=["grid_gicp", "bbs_cpu_gicp", "bbs_gpu_gicp"],
+                                   description="Global recovery backend (shared GICP refinement)"),
+--- a/src/robocon_cloud_localization/src/loop_closure_pgo.cpp
++++ b/src/robocon_cloud_localization/src/loop_closure_pgo.cpp
+@@ -40,6 +40,8 @@
+ #include <utility>
+ #include <vector>
+ #include "global_relocalization.hpp"
++#include "mapping_registration.hpp"
++#include "stamped_pose_buffer.hpp"
+ 
+ using Cloud = pcl::PointCloud<pcl::PointXYZI>;
+ using namespace std::chrono_literals;
+@@ -51,6 +53,7 @@
+ }
+ 
+ struct Keyframe {
++  int64_t stamp = 0;
+   gtsam::Pose3 wheel_pose;
+   gtsam::Pose3 lio_pose;
+   Cloud::Ptr cloud{new Cloud};
+@@ -74,8 +77,27 @@
+     declare_parameter("loop_separation", 12);
+     declare_parameter("loop_similarity", 0.42);
+     declare_parameter("gicp_max_correspondence", 0.8);
+-    declare_parameter("loop_fitness_max", 0.10);
+-    declare_parameter("loop_inlier_ratio_min", 0.35);
++    declare_parameter("loop_fitness_max", 0.01);
++    declare_parameter("loop_inlier_ratio_min", 0.70);
++    declare_parameter("mapping_sync_max_gap", 0.20);
++    declare_parameter("mapping_local_registration", true);
++    declare_parameter("mapping_local_submap_frames", 5);
++    declare_parameter("mapping_local_fitness_max", 0.01);
++    declare_parameter("mapping_local_inlier_ratio_min", 0.70);
++    declare_parameter("mapping_local_max_correction", 0.30);
++    declare_parameter("mapping_local_max_rotation", 0.15);
++    declare_parameter("loop_search_radius", 2.5);
++    declare_parameter("loop_min_time", 15.0);
++    declare_parameter("loop_candidates", 3);
++    declare_parameter("loop_submap_frames", 2);
++    declare_parameter("loop_inlier_distance", 0.20);
++    declare_parameter("loop_max_correction", 1.0);
++    declare_parameter("loop_max_rotation", 0.35);
++    declare_parameter("loop_consistent_frames", 2);
++    declare_parameter("loop_consistency_translation", 0.20);
++    declare_parameter("loop_consistency_rotation", 0.10);
++    declare_parameter("loop_min_interval", 3.0);
++    declare_parameter("loop_ambiguity_ratio", 1.25);
+     declare_parameter("localization_fitness_max", 0.35);
+     declare_parameter("localization_icp_weight", 0.10);
+     declare_parameter("localization_max_correction", 0.35);
+@@ -155,10 +177,28 @@
+        get_parameter("localization_bbs_cpu_threads").as_int()<1||
+        get_parameter("localization_bbs_gpu_batch_size").as_int()<1)
+       throw std::runtime_error("Invalid BBS search parameters");
++    for(const auto *key:{"mapping_sync_max_gap","mapping_local_fitness_max",
++      "mapping_local_max_correction","mapping_local_max_rotation","loop_search_radius",
++      "loop_min_time","loop_inlier_distance","loop_max_correction","loop_max_rotation",
++      "loop_consistency_translation","loop_consistency_rotation","loop_min_interval","loop_fitness_max"}) {
++      const double value=get_parameter(key).as_double();
++      if(!std::isfinite(value)||value<=0)throw std::runtime_error(std::string(key)+" must be positive");
++    }
++    for(const auto *key:{"mapping_local_inlier_ratio_min","loop_inlier_ratio_min"}) {
++      const double value=get_parameter(key).as_double();
++      if(!std::isfinite(value)||value<=0||value>1)throw std::runtime_error(std::string(key)+" must be in (0,1]");
++    }
++    if(get_parameter("mapping_local_submap_frames").as_int()<1||get_parameter("loop_candidates").as_int()<1||
++      get_parameter("loop_submap_frames").as_int()<0||get_parameter("loop_consistent_frames").as_int()<1||
++      get_parameter("loop_separation").as_int()<1)throw std::runtime_error("Invalid mapping frame counts");
++    if(!std::isfinite(get_parameter("loop_ambiguity_ratio").as_double())||
++       get_parameter("loop_ambiguity_ratio").as_double()<1)throw std::runtime_error("Invalid loop ambiguity ratio");
+     const auto robust = gtsam::noiseModel::Robust::Create(
+       gtsam::noiseModel::mEstimator::Huber::Create(1.5),
+       gtsam::noiseModel::Diagonal::Sigmas((gtsam::Vector(6) << .04,.04,.04,.025,.025,.035).finished()));
+     loop_noise_ = robust;
++    mapping_noise_=gtsam::noiseModel::Robust::Create(gtsam::noiseModel::mEstimator::Huber::Create(1.5),
++      gtsam::noiseModel::Diagonal::Sigmas((gtsam::Vector(6)<<.02,.02,.02,.03,.03,.03).finished()));
+     wheel_noise_ = gtsam::noiseModel::Diagonal::Sigmas((gtsam::Vector(6) << .03,.03,.05,.08,.08,.25).finished());
+     lio_noise_ = gtsam::noiseModel::Robust::Create(
+       gtsam::noiseModel::mEstimator::Huber::Create(1.5),
+@@ -176,6 +216,18 @@
+     cloud_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
+       "/livox/lidar", rclcpp::SensorDataQoS(),
+       std::bind(&LoopClosurePGO::cloudCallback, this, std::placeholders::_1));
++    mapping_cloud_sub_=create_subscription<sensor_msgs::msg::PointCloud2>(
++      "/fast_lio/cloud_registered_body",rclcpp::QoS(10),
++      [this](sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) {
++        std::lock_guard<std::mutex> lock(mutex_);
++        if(mode_!="map"||msg->data.empty())return;
++        mapping_pending_.push_back(msg);
++        if(mapping_pending_.size()>20) {
++          mapping_pending_.pop_front();
++          RCLCPP_WARN_THROTTLE(get_logger(),*get_clock(),5000,"Mapping scan queue overflow; discarding oldest scan");
++        }
++        processMappingScans();
++      });
+     lio_odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
+       "/fast_lio/position", 50,
+       std::bind(&LoopClosurePGO::lioOdomCallback, this, std::placeholders::_1));
+@@ -236,9 +288,12 @@
+     const auto period = std::chrono::duration<double>(1.0 / get_parameter("map_publish_rate").as_double());
+     map_timer_ = create_wall_timer(period, std::bind(&LoopClosurePGO::publishMap, this));
+     if (mode_ == "localize") loadMap();
+-    const auto map_source = map_file_.empty() ? map_directory_ : map_file_;
++    const auto map_source = mode_=="map" ? map_directory_ : (map_file_.empty() ? map_directory_ : map_file_);
+     RCLCPP_INFO(get_logger(), "FAST-LIO2 pose graph ready: Scan Context + GICP loop checks + GTSAM/iSAM2; mode=%s, map=%s",
+       mode_.c_str(), map_source.c_str());
++    if(mode_=="map")RCLCPP_INFO(get_logger(),
++      "Mapping input=/fast_lio/cloud_registered_body; timestamp-aligned wheel/LIO; local submap GICP=%s; save optimized map with /save_map",
++      get_parameter("mapping_local_registration").as_bool()?"enabled":"disabled");
+   }
+ 
+  private:
+@@ -294,14 +349,19 @@
+   void lioOdomCallback(const nav_msgs::msg::Odometry::SharedPtr msg) {
+     std::lock_guard<std::mutex> lock(mutex_);
+     latest_lio_=fromMsg(msg->pose.pose); latest_stamp_=msg->header.stamp; have_lio_pose_=true;
++    lio_buffer_.add(rclcpp::Time(msg->header.stamp).nanoseconds(),latest_lio_);
++    if(mode_=="map")processMappingScans();
+     publishPose(msg->header.stamp);
+   }
+   void wheelOdomCallback(const nav_msgs::msg::Odometry::SharedPtr msg) {
+     std::lock_guard<std::mutex> lock(mutex_);
+     latest_wheel_=fromMsg(msg->pose.pose); have_wheel_pose_=true;
++    wheel_buffer_.add(rclcpp::Time(msg->header.stamp).nanoseconds(),latest_wheel_);
++    if(mode_=="map"){processMappingScans();publishPose(latest_stamp_);}
+   }
+   void cloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) {
+     std::lock_guard<std::mutex> lock(mutex_);
++    if(mode_!="localize")return;
+     if (!have_lio_pose_ || !have_wheel_pose_ || msg->data.empty()) return;
+     Cloud::Ptr input(new Cloud);
+     // MID360 clouds call the float intensity field `reflectivity`; PCL's
+@@ -318,24 +378,47 @@
+     if (input->size()<80) return;
+     auto cloud=downsample(input);
+     if(cloud->size()<50) return;
+-    if(mode_=="localize") { localize(cloud,msg->header.stamp); return; }
++    localize(cloud,msg->header.stamp);
++  }
++  void processMappingScans() {
++    while(!mapping_pending_.empty()) {
++      const auto msg=mapping_pending_.front();
++      const auto stamp=rclcpp::Time(msg->header.stamp).nanoseconds();
++      gtsam::Pose3 wheel,lio;
++      const double gap=get_parameter("mapping_sync_max_gap").as_double();
++      if(!wheel_buffer_.lookup(stamp,gap,wheel)||!lio_buffer_.lookup(stamp,gap,lio)) {
++        // Wait for a future bracket, but never wait forever for an old hole.
++        if(wheel_buffer_.newest()<=stamp||lio_buffer_.newest()<=stamp)return;
++        mapping_pending_.pop_front();
++        RCLCPP_WARN_THROTTLE(get_logger(),*get_clock(),5000,"Mapping scan rejected: no time-aligned wheel/LIO poses");
++        continue;
++      }
++      mapping_pending_.pop_front();
++      Cloud::Ptr input(new Cloud);pcl::fromROSMsg(*msg,*input);
++      auto cloud=downsample(input);
++      if(cloud->size()>=50)addMappingKeyframe(cloud,msg->header.stamp,wheel,lio);
++    }
++  }
++  void addMappingKeyframe(const Cloud::Ptr &cloud,const builtin_interfaces::msg::Time &stamp,
++                         const gtsam::Pose3 &wheel,const gtsam::Pose3 &lio) {
+     if (last_keyframe_) {
+-      const rclcpp::Time current_stamp(msg->header.stamp);
++      const rclcpp::Time current_stamp(stamp);
+       const rclcpp::Time previous_stamp(last_keyframe_stamp_);
+       if ((current_stamp-previous_stamp).seconds() < get_parameter("keyframe_min_interval").as_double())
+         return;
+     }
+     const auto lidar_in_base=lidarInBase();
+-    const auto wheel_lidar=latest_wheel_.compose(lidar_in_base);
++    const auto wheel_lidar=wheel.compose(lidar_in_base);
+     if (!have_wheel_anchor_) { wheel_anchor_=wheel_lidar; have_wheel_anchor_=true; }
+-    if (!have_lio_anchor_) { lio_anchor_=latest_lio_; have_lio_anchor_=true; }
++    if (!have_lio_anchor_) { lio_anchor_=lio; have_lio_anchor_=true; }
+     const auto wheel_pose=wheel_anchor_.between(wheel_lidar);
+-    const auto lio_pose=lio_anchor_.between(latest_lio_);
++    const auto lio_pose=lio_anchor_.between(lio);
+     const double moved=last_keyframe_?keyframes_.back().wheel_pose.between(wheel_pose).translation().norm():1e9;
+     const Eigen::Vector3d turn_rpy=last_keyframe_?keyframes_.back().wheel_pose.between(wheel_pose).rotation().rpy():Eigen::Vector3d(1e9,0,0);
+     const double turned=turn_rpy.norm();
+     if(last_keyframe_&&moved<get_parameter("keyframe_distance").as_double()&&turned<get_parameter("keyframe_yaw").as_double())return;
+-    Keyframe kf; kf.wheel_pose=wheel_pose; kf.lio_pose=lio_pose; kf.cloud=cloud; kf.descriptor=scanContext(*cloud);
++    Keyframe kf; kf.stamp=rclcpp::Time(stamp).nanoseconds();
++    kf.wheel_pose=wheel_pose; kf.lio_pose=lio_pose; kf.cloud=cloud; kf.descriptor=scanContext(*cloud);
+     const size_t index=keyframes_.size();
+     if(index==0) {
+       graph_.add(gtsam::PriorFactor<gtsam::Pose3>(0,kf.wheel_pose,prior_noise_));
+@@ -349,56 +432,122 @@
+       // field scans make the inertial lidar frontend temporarily degenerate.
+       graph_.add(gtsam::BetweenFactor<gtsam::Pose3>(index-1,index,
+         keyframes_.back().lio_pose.between(kf.lio_pose),lio_noise_));
+-      initials_.insert(index,kf.wheel_pose);
++      const auto previous=optimized_.at<gtsam::Pose3>(index-1);
++      const auto wheel_step=keyframes_.back().wheel_pose.between(kf.wheel_pose);
++      auto initial=previous.compose(wheel_step);
++      if(get_parameter("mapping_local_registration").as_bool()) {
++        const size_t frames=get_parameter("mapping_local_submap_frames").as_int();
++        const auto target=mappingSubmap(index-1,index>frames?index-frames:0,index);
++        const auto match=robocon::matchMappingCloud(kf.cloud,target,wheel_step.matrix().cast<float>(),
++          get_parameter("gicp_max_correspondence").as_double(),
++          get_parameter("mapping_local_fitness_max").as_double(),get_parameter("loop_inlier_distance").as_double(),
++          get_parameter("mapping_local_inlier_ratio_min").as_double(),
++          get_parameter("mapping_local_max_correction").as_double(),get_parameter("mapping_local_max_rotation").as_double());
++        if(match.accepted) {
++          const gtsam::Pose3 relative(Eigen::Matrix4d(match.pose.cast<double>()));
++          graph_.add(gtsam::BetweenFactor<gtsam::Pose3>(index-1,index,relative,mapping_noise_));
++          initial=previous.compose(relative);++mapping_match_count_;
++        }
++        RCLCPP_INFO_THROTTLE(get_logger(),*get_clock(),3000,
++          "Mapping local GICP %s: mse=%.5f m^2 overlap=%.1f%% correction=%.3f m/%.3f rad",
++          match.accepted?"accepted":"rejected",match.mse,match.overlap*100,match.translation,match.rotation);
++      }
++      initials_.insert(index,initial);
+       isam_->update(graph_,initials_); graph_.resize(0); initials_.clear();
+       detectLoop(index,kf);
+     }
+-    keyframes_.push_back(std::move(kf)); last_keyframe_=true; last_keyframe_stamp_=msg->header.stamp;
++    keyframes_.push_back(std::move(kf)); last_keyframe_=true; last_keyframe_stamp_=stamp;
+     optimized_=isam_->calculateEstimate();
+     RCLCPP_INFO_THROTTLE(get_logger(),*get_clock(),5000,"FAST-LIO2 keyframes=%zu loop closures=%zu",keyframes_.size(),loop_count_);
+     publishPath();
+   }
++  Cloud::Ptr mappingSubmap(size_t origin,size_t begin,size_t end) const {
++    Cloud::Ptr combined(new Cloud);
++    const auto inverse=optimized_.at<gtsam::Pose3>(origin).inverse();
++    for(size_t i=begin;i<end;++i) {
++      Cloud transformed;
++      pcl::transformPointCloud(*keyframes_[i].cloud,transformed,
++        inverse.compose(optimized_.at<gtsam::Pose3>(i)).matrix().cast<float>());
++      *combined+=transformed;
++    }
++    return downsample(combined);
++  }
+   void detectLoop(size_t current,const Keyframe &kf) {
+-    if(current<=static_cast<size_t>(get_parameter("loop_separation").as_int())) return;
+-    double best=get_parameter("loop_similarity").as_double();
+-    size_t candidate=current, nearest=0;
+-    double nearest_distance=std::numeric_limits<double>::infinity();
+-    for(size_t i=0;i+get_parameter("loop_separation").as_int()<current;++i) {
+-      const double d=contextDistance(kf.descriptor,keyframes_[i].descriptor);
+-      if(d<nearest_distance){nearest_distance=d;nearest=i;}
+-      if(d<best){best=d;candidate=i;}
+-    }
+-    if(candidate==current) {
+-      RCLCPP_INFO(get_logger(),"No Scan Context loop candidate at keyframe %zu: nearest=%zu distance=%.3f threshold=%.3f",
+-        current,nearest,nearest_distance,get_parameter("loop_similarity").as_double());
++    const size_t separation=get_parameter("loop_separation").as_int();
++    if(current<=separation)return;
++    if(last_loop_stamp_ && (kf.stamp-last_loop_stamp_)*1e-9<get_parameter("loop_min_interval").as_double())return;
++    const auto predicted=isam_->calculateEstimate<gtsam::Pose3>(current);
++    struct Candidate {size_t index;double descriptor;};
++    std::vector<Candidate> candidates;
++    size_t nearby=0;
++    for(size_t i=0;i+separation<current;++i) {
++      if((kf.stamp-keyframes_[i].stamp)*1e-9<get_parameter("loop_min_time").as_double())continue;
++      const auto pose=optimized_.at<gtsam::Pose3>(i);
++      if((pose.translation()-predicted.translation()).norm()>get_parameter("loop_search_radius").as_double())continue;
++      ++nearby;
++      const double distance=contextDistance(kf.descriptor,keyframes_[i].descriptor);
++      if(distance<=get_parameter("loop_similarity").as_double())candidates.push_back({i,distance});
++    }
++    std::sort(candidates.begin(),candidates.end(),[](const auto &a,const auto &b){return a.descriptor<b.descriptor;});
++    if(candidates.size()>static_cast<size_t>(get_parameter("loop_candidates").as_int()))
++      candidates.resize(get_parameter("loop_candidates").as_int());
++    if(candidates.empty()) {
++      pending_loop_count_=0;
++      RCLCPP_INFO(get_logger(),"No verified loop proposal at keyframe %zu: nearby historical frames=%zu",current,nearby);
+       return;
+     }
+-    const auto predicted=keyframes_[candidate].wheel_pose.between(kf.wheel_pose);
+-    const Eigen::Matrix4f guess=predicted.matrix().cast<float>();
+-    pcl::GeneralizedIterativeClosestPoint<pcl::PointXYZI,pcl::PointXYZI> gicp;
+-    gicp.setMaximumIterations(45);
+-    gicp.setMaxCorrespondenceDistance(get_parameter("gicp_max_correspondence").as_double());
+-    gicp.setTransformationEpsilon(1e-5); gicp.setEuclideanFitnessEpsilon(1e-5);
+-    gicp.setInputSource(kf.cloud); gicp.setInputTarget(keyframes_[candidate].cloud);
+-    Cloud aligned; gicp.align(aligned,guess);
+-    if(!gicp.hasConverged()) {
+-      RCLCPP_INFO(get_logger(),"GICP rejected loop candidate %zu->%zu: optimizer did not converge (Scan Context %.3f)",candidate,current,best);
++    robocon::MappingMatch best;best.mse=std::numeric_limits<double>::infinity();
++    std::vector<std::pair<double,gtsam::Pose3>> alternatives;
++    size_t candidate=current;double descriptor=0;
++    for(const auto &proposal:candidates) {
++      const size_t i=proposal.index,neighbors=get_parameter("loop_submap_frames").as_int();
++      const auto target=mappingSubmap(i,i>neighbors?i-neighbors:0,std::min(i+neighbors+1,current-separation));
++      const auto guess=optimized_.at<gtsam::Pose3>(i).between(predicted).matrix().cast<float>();
++      const auto match=robocon::matchMappingCloud(kf.cloud,target,guess,
++        get_parameter("gicp_max_correspondence").as_double(),get_parameter("loop_fitness_max").as_double(),
++        get_parameter("loop_inlier_distance").as_double(),get_parameter("loop_inlier_ratio_min").as_double(),
++        get_parameter("loop_max_correction").as_double(),get_parameter("loop_max_rotation").as_double());
++      if(match.accepted&&match.mse<best.mse){best=match;candidate=i;descriptor=proposal.descriptor;}
++      if(match.accepted)alternatives.emplace_back(match.mse,optimized_.at<gtsam::Pose3>(i).compose(
++        gtsam::Pose3(Eigen::Matrix4d(match.pose.cast<double>()))));
++      if(!match.accepted)RCLCPP_INFO(get_logger(),
++        "Rejected loop %zu->%zu: mse=%.5f m^2 overlap=%.1f%% correction=%.3f m/%.3f rad",
++        i,current,match.mse,match.overlap*100,match.translation,match.rotation);
++    }
++    if(candidate==current){pending_loop_count_=0;return;}
++    const gtsam::Pose3 relative(Eigen::Matrix4d(best.pose.cast<double>()));
++    const auto measured=optimized_.at<gtsam::Pose3>(candidate).compose(relative);
++    for(const auto &alternative:alternatives) {
++      const auto difference=measured.between(alternative.second);
++      if(alternative.first<=best.mse*get_parameter("loop_ambiguity_ratio").as_double()+1e-5&&
++         (difference.translation().norm()>.50||gtsam::Rot3::Logmap(difference.rotation()).norm()>.20)) {
++        pending_loop_count_=0;
++        RCLCPP_WARN(get_logger(),"Rejected ambiguous loop at keyframe %zu: similarly good matches at different poses",current);
++        return;
++      }
++    }
++    const auto expected=pending_loop_pose_.compose(pending_loop_wheel_.between(kf.wheel_pose));
++    const auto change=expected.between(measured);
++    const bool agrees=pending_loop_count_>0 && current==pending_loop_index_+1 &&
++      change.translation().norm()<=get_parameter("loop_consistency_translation").as_double()&&
++      gtsam::Rot3::Logmap(change.rotation()).norm()<=get_parameter("loop_consistency_rotation").as_double();
++    pending_loop_count_=agrees?pending_loop_count_+1:1;
++    pending_loop_pose_=measured;pending_loop_wheel_=kf.wheel_pose;pending_loop_index_=current;
++    if(pending_loop_count_<get_parameter("loop_consistent_frames").as_int()) {
++      RCLCPP_INFO(get_logger(),"Loop %zu->%zu pending: %d/%ld consistent keyframes, mse=%.5f m^2 overlap=%.1f%%",
++        candidate,current,pending_loop_count_,get_parameter("loop_consistent_frames").as_int(),best.mse,best.overlap*100);
+       return;
+     }
+-    const double fitness=gicp.getFitnessScore(get_parameter("gicp_max_correspondence").as_double());
+-    pcl::search::KdTree<pcl::PointXYZI> tree;
+-    tree.setInputCloud(keyframes_[candidate].cloud);
+-    size_t inliers=0;
+-    for(const auto &p:aligned.points){std::vector<int> ids(1);std::vector<float> ds(1);if(tree.nearestKSearch(p,1,ids,ds)>0&&ds[0]<std::pow(get_parameter("gicp_max_correspondence").as_double(),2))++inliers;}
+-    const double overlap=aligned.empty()?0.0:double(inliers)/aligned.size();
+-    if(fitness>get_parameter("loop_fitness_max").as_double()||overlap<get_parameter("loop_inlier_ratio_min").as_double()){
+-      RCLCPP_INFO(get_logger(),"GICP rejected loop %zu->%zu: Scan Context %.3f, fitness %.3fm (limit %.3fm), overlap %.0f%% (minimum %.0f%%)",
+-        candidate,current,best,fitness,get_parameter("loop_fitness_max").as_double(),overlap*100,get_parameter("loop_inlier_ratio_min").as_double()*100);return;
+-    }
+-    const gtsam::Pose3 relative(Eigen::Matrix4d(gicp.getFinalTransformation().cast<double>()));
+     graph_.add(gtsam::BetweenFactor<gtsam::Pose3>(candidate,current,relative,loop_noise_));
+-    isam_->update(graph_); graph_.resize(0); ++loop_count_;
+-    RCLCPP_WARN(get_logger(),"Accepted Scan Context loop %zu->%zu (descriptor=%.3f GICP=%.3fm overlap=%.0f%%); iSAM2 updated",candidate,current,best,fitness,overlap*100);
++    isam_->update(graph_);graph_.resize(0);
++    // Large loop corrections need relinearization of existing factors too.
++    for(int i=0;i<3;++i)isam_->update();
++    ++loop_count_;last_loop_stamp_=kf.stamp;pending_loop_count_=0;
++    const auto corrected=isam_->calculateEstimate<gtsam::Pose3>(current);
++    const auto delta=predicted.between(corrected);
++    RCLCPP_WARN(get_logger(),
++      "Accepted verified loop %zu->%zu: descriptor=%.3f mse=%.5f m^2 overlap=%.1f%%; graph correction=%.3f m/%.3f rad; rebuilding all keyframes",
++      candidate,current,descriptor,best.mse,best.overlap*100,delta.translation().norm(),gtsam::Rot3::Logmap(delta.rotation()).norm());
+   }
+   Eigen::Matrix4f poseMatrix(size_t i) const { return optimized_.at<gtsam::Pose3>(i).matrix().cast<float>(); }
+   void pollGlobalSearch() {
+@@ -647,7 +796,10 @@
+     // latest_wheel_ is the odom-frame base pose. Convert it to the simulated
+     // lidar origin, then derive the one map -> odom correction that makes the
+     // standard odom -> base_footprint -> mid360 chain agree with the graph.
+-    const auto odom_lidar = latest_wheel_.compose(lidarInBase());
++    auto wheel=latest_wheel_;
++    if(mode_=="map"&&!wheel_buffer_.lookup(rclcpp::Time(stamp).nanoseconds(),
++       get_parameter("mapping_sync_max_gap").as_double(),wheel))return;
++    const auto odom_lidar = wheel.compose(lidarInBase());
+     const auto map_odom = map_lidar.compose(odom_lidar.inverse());
+     const auto t = map_odom.translation();
+     const auto q = map_odom.rotation().toQuaternion();
+@@ -674,7 +826,10 @@
+     // that keyframe using the same wheel odometry used by the graph. Finally,
+     // cancel the raw FAST-LIO transform so the composed map -> base TF follows
+     // the simulated odometry and stops when the Gazebo robot stops.
+-    const auto wheel_lidar=latest_wheel_.compose(lidarInBase());
++    gtsam::Pose3 wheel;
++    if(!wheel_buffer_.lookup(rclcpp::Time(stamp).nanoseconds(),
++       get_parameter("mapping_sync_max_gap").as_double(),wheel))return;
++    const auto wheel_lidar=wheel.compose(lidarInBase());
+     const auto wheel_pose=wheel_anchor_.between(wheel_lidar);
+     const auto wheel_delta=keyframes_.back().wheel_pose.between(wheel_pose);
+     const auto target_pose=optimized_.at<gtsam::Pose3>(keyframes_.size()-1).compose(wheel_delta);
+@@ -699,7 +854,7 @@
+     Cloud combined;
+     for(size_t i=0;i<keyframes_.size();++i){Cloud transformed;pcl::transformPointCloud(*keyframes_[i].cloud,transformed,poseMatrix(i));combined+=transformed;}
+     sensor_msgs::msg::PointCloud2 msg;pcl::toROSMsg(combined,msg);msg.header.stamp=now();msg.header.frame_id="map";map_pub_->publish(msg);
+-    publishPose(msg.header.stamp);
++    publishPose(latest_stamp_);
+   }
+   void saveMap(const std_srvs::srv::Trigger::Request::SharedPtr,const std_srvs::srv::Trigger::Response::SharedPtr res) {
+     std::lock_guard<std::mutex> lock(mutex_);
+@@ -722,7 +877,7 @@
+     pcl::VoxelGrid<pcl::PointXYZI> voxel;voxel.setInputCloud(combined.makeShared());voxel.setLeafSize(.05,.05,.05);
+     Cloud filtered;voxel.filter(filtered);
+     const auto pcd=dir/"map.pcd";const int result=pcl::io::savePCDFileBinary(pcd.string(),filtered);
+-    std::ofstream info(dir/"map_info.txt");info<<"frontend=FAST-LIO2 (IKFoM + ikd-Tree)\nloop_detection=Scan Context\nloop_verification=GICP fitness and overlap\npose_graph=GTSAM iSAM2, wheel-odometry factors plus robust FAST-LIO2 relative factors\nlidar_mount_translation_base_footprint=-0.10,0,0.46\nlidar_mount_rpy_base_footprint=3.1415926536,0,0\nkeyframes="<<keyframes_.size()<<"\nloop_closures="<<loop_count_<<"\npoints="<<filtered.size()<<"\nframe=map, anchored at the initial lidar pose\n";
++    std::ofstream info(dir/"map_info.txt");info<<"frontend=FAST-LIO2 (IKFoM + ikd-Tree)\nmapping_cloud=/fast_lio/cloud_registered_body\nmapping_pose_sync=timestamp interpolation\nloop_detection=Scan Context\nloop_verification=historical submap GICP, all-point MSE, tight overlap, bounded innovation, consecutive keyframes\npose_graph=GTSAM iSAM2, wheel-odometry factors plus robust FAST-LIO2 relative factors\nlidar_mount_translation_base_footprint=-0.10,0,0.46\nlidar_mount_rpy_base_footprint=3.1415926536,0,0\nkeyframes="<<keyframes_.size()<<"\nlocal_registration_factors="<<mapping_match_count_<<"\nloop_closures="<<loop_count_<<"\npoints="<<filtered.size()<<"\nframe=map, anchored at the initial lidar pose\n";
+     res->success=result==0;res->message=std::string(res->success?"Saved ":"Failed to write ")+pcd.string()+" ("+std::to_string(filtered.size())+" points, "+std::to_string(keyframes_.size())+" keyframes, "+std::to_string(loop_count_)+" verified loops)";
+   }
+   void loadMap() {
+@@ -757,10 +912,17 @@
+   std::future<robocon::GlobalResult> global_search_;
+   std::shared_ptr<robocon::GlobalSearchBackend> global_backend_;
+   std::vector<Keyframe> keyframes_;Cloud::Ptr map_cloud_{new Cloud};
++  StampedPoseBuffer wheel_buffer_,lio_buffer_;
++  std::deque<sensor_msgs::msg::PointCloud2::ConstSharedPtr> mapping_pending_;
++  size_t mapping_match_count_=0,pending_loop_index_=0;
++  int pending_loop_count_=0;
++  int64_t last_loop_stamp_=0;
++  gtsam::Pose3 pending_loop_pose_,pending_loop_wheel_;
+   gtsam::NonlinearFactorGraph graph_;gtsam::Values initials_,optimized_;
+-  std::unique_ptr<gtsam::ISAM2> isam_;gtsam::SharedNoiseModel loop_noise_,wheel_noise_,lio_noise_,prior_noise_;
++  std::unique_ptr<gtsam::ISAM2> isam_;gtsam::SharedNoiseModel loop_noise_,wheel_noise_,lio_noise_,prior_noise_,mapping_noise_;
+   builtin_interfaces::msg::Time last_keyframe_stamp_;
+   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_sub_;
++  rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr mapping_cloud_sub_;
+   rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr initial_pose_sub_;
+   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr lio_odom_sub_,wheel_odom_sub_;
+   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr map_pub_;
+--- /dev/null
++++ b/src/robocon_cloud_localization/src/mapping_registration.cpp
+@@ -0,0 +1,40 @@
++#include "mapping_registration.hpp"
++#include <pcl/registration/gicp.h>
++#include <pcl/search/kdtree.h>
++#include <Eigen/Geometry>
++#include <algorithm>
++#include <cmath>
++#include <limits>
++
++namespace robocon {
++MappingMatch matchMappingCloud(const RegistrationCloud::ConstPtr &source,
++  const RegistrationCloud::ConstPtr &target,const Eigen::Matrix4f &guess,
++  double correspondence,double mse_max,double inlier_distance,
++  double overlap_min,double translation_max,double rotation_max) {
++  MappingMatch result;result.mse=std::numeric_limits<double>::infinity();
++  if(!source||!target||source->size()<50||target->size()<50||!guess.allFinite())return result;
++  pcl::GeneralizedIterativeClosestPoint<pcl::PointXYZI,pcl::PointXYZI> gicp;
++  gicp.setMaximumIterations(45);gicp.setMaxCorrespondenceDistance(correspondence);
++  gicp.setTransformationEpsilon(1e-5);gicp.setEuclideanFitnessEpsilon(1e-5);
++  gicp.setInputSource(source);gicp.setInputTarget(target);
++  RegistrationCloud aligned;gicp.align(aligned,guess);
++  if(!gicp.hasConverged()||aligned.empty()||!gicp.getFinalTransformation().allFinite())return result;
++  result.pose=gicp.getFinalTransformation();
++  // Compare translation in target axes; the SE(3) relative translation would
++  // couple a small rotation to the distance from a distant submap origin.
++  result.translation=(result.pose.block<3,1>(0,3)-guess.block<3,1>(0,3)).norm();
++  result.rotation=Eigen::AngleAxisf(result.pose.block<3,3>(0,0)*guess.block<3,3>(0,0).transpose()).angle();
++  pcl::search::KdTree<pcl::PointXYZI> tree;tree.setInputCloud(target);
++  double squared=0;size_t inliers=0;std::vector<int> ids(1);std::vector<float> distances(1);
++  const double cap=correspondence*correspondence,cutoff=inlier_distance*inlier_distance;
++  for(const auto &point:aligned) {
++    if(!pcl::isFinite(point)||tree.nearestKSearch(point,1,ids,distances)<=0){squared+=cap;continue;}
++    squared+=std::min<double>(distances[0],cap);
++    if(distances[0]<=cutoff)++inliers;
++  }
++  result.mse=squared/aligned.size();result.overlap=double(inliers)/aligned.size();
++  result.accepted=std::isfinite(result.mse)&&result.mse<=mse_max&&result.overlap>=overlap_min&&
++    result.translation<=translation_max&&result.rotation<=rotation_max;
++  return result;
++}
++}
+--- /dev/null
++++ b/src/robocon_cloud_localization/src/mapping_registration.hpp
+@@ -0,0 +1,16 @@
++#pragma once
++#include "global_relocalization.hpp"
++
++namespace robocon {
++struct MappingMatch {
++  bool accepted = false;
++  Eigen::Matrix4f pose = Eigen::Matrix4f::Identity();
++  double mse = 0, overlap = 0, translation = 0, rotation = 0;
++};
++// All-point capped MSE and tight inlier distance are deliberately separate
++// from GICP's larger correspondence radius used to find correspondences.
++MappingMatch matchMappingCloud(const RegistrationCloud::ConstPtr &source,
++  const RegistrationCloud::ConstPtr &target, const Eigen::Matrix4f &guess,
++  double correspondence, double mse_max, double inlier_distance,
++  double overlap_min, double translation_max, double rotation_max);
++}
+--- /dev/null
++++ b/src/robocon_cloud_localization/src/stamped_pose_buffer.hpp
+@@ -0,0 +1,32 @@
++#pragma once
++#include <gtsam/geometry/Pose3.h>
++#include <deque>
++
++// Interpolate only bracketed measurements. Never silently attach a scan to
++// the newest (possibly much older/newer) odometry measurement.
++class StampedPoseBuffer {
++ public:
++  struct Entry {int64_t stamp;gtsam::Pose3 pose;};
++  void add(int64_t stamp,const gtsam::Pose3 &pose) {
++    if(!data_.empty()&&stamp<data_.back().stamp)data_.clear();
++    if(!data_.empty()&&stamp==data_.back().stamp){data_.back().pose=pose;return;}
++    data_.push_back({stamp,pose});
++    while(data_.size()>2&&stamp-data_.front().stamp>30000000000LL)data_.pop_front();
++  }
++  bool lookup(int64_t stamp,double max_gap,gtsam::Pose3 &pose) const {
++    for(size_t i=0;i<data_.size();++i) {
++      if(data_[i].stamp==stamp){pose=data_[i].pose;return true;}
++      if(i==0||data_[i].stamp<stamp)continue;
++      const auto &a=data_[i-1],&b=data_[i];
++      if(stamp<a.stamp||(b.stamp-a.stamp)*1e-9>max_gap)return false;
++      const double ratio=double(stamp-a.stamp)/(b.stamp-a.stamp);
++      pose=gtsam::Pose3(gtsam::Rot3(a.pose.rotation().toQuaternion().slerp(ratio,b.pose.rotation().toQuaternion())),
++        (1-ratio)*a.pose.translation()+ratio*b.pose.translation());
++      return true;
++    }
++    return false;
++  }
++  int64_t newest() const {return data_.empty()?0:data_.back().stamp;}
++ private:
++  std::deque<Entry> data_;
++};
+--- /dev/null
++++ b/src/robocon_cloud_localization/test/mapping_registration_test.cpp
+@@ -0,0 +1,45 @@
++#include "mapping_registration.hpp"
++#include "stamped_pose_buffer.hpp"
++#include <pcl/common/transforms.h>
++#include <Eigen/Geometry>
++#include <cmath>
++#include <iostream>
++#include <random>
++#include <stdexcept>
++
++static void require(bool ok,const char *why){if(!ok)throw std::runtime_error(why);}
++int main() {
++  try {
++    StampedPoseBuffer buffer;
++    const auto end=gtsam::Pose3(gtsam::Rot3::Rz(.4),gtsam::Point3(1,2,3));
++    buffer.add(1000000000,gtsam::Pose3());buffer.add(1100000000,end);
++    gtsam::Pose3 middle;
++    require(buffer.lookup(1050000000,.2,middle),"Missing bracketed interpolation");
++    require((middle.translation()-gtsam::Point3(.5,1,1.5)).norm()<1e-8,"Wrong timestamp translation");
++    require(std::abs(middle.rotation().yaw()-.2)<1e-8,"Wrong timestamp rotation");
++    require(!buffer.lookup(900000000,.2,middle)&&!buffer.lookup(1200000000,.2,middle),"Extrapolated old/new pose");
++    require(!buffer.lookup(1050000000,.05,middle),"Interpolated across excessive measurement gap");
++    buffer.add(500000000,gtsam::Pose3());
++    require(!buffer.lookup(1000000000,.2,middle),"Clock rollback retained stale measurements");
++    robocon::RegistrationCloud::Ptr source(new robocon::RegistrationCloud),target(new robocon::RegistrationCloud);
++    std::mt19937 rng(42);std::uniform_real_distribution<float> value(-2,2);
++    for(int i=0;i<1500;++i){pcl::PointXYZI p;p.x=value(rng);p.y=value(rng);p.z=value(rng);p.intensity=0;source->push_back(p);}
++    Eigen::Matrix4f pose=Eigen::Matrix4f::Identity();pose.block<3,3>(0,0)=Eigen::AngleAxisf(.1,Eigen::Vector3f::UnitZ()).toRotationMatrix();
++    pose(0,3)=.15;pcl::transformPointCloud(*source,*target,pose);
++    const auto match=robocon::matchMappingCloud(source,target,Eigen::Matrix4f::Identity(),.8,.01,.2,.7,.3,.15);
++    require(match.accepted&&(match.pose-pose).norm()<.02,"Failed valid mapping registration");
++    require(!robocon::matchMappingCloud(source,target,Eigen::Matrix4f::Identity(),.8,.01,.2,.7,.05,.15).accepted,
++      "Ignored correction gate");
++    robocon::RegistrationCloud::Ptr partial(new robocon::RegistrationCloud(*source));
++    for(int i=0;i<4000;++i){auto p=source->points[i%source->size()];p.x+=20;partial->push_back(p);}
++    require(!robocon::matchMappingCloud(partial,target,Eigen::Matrix4f::Identity(),.8,.01,.2,.7,.3,.15).accepted,
++      "Accepted low overlap using only nearest matching subset");
++    robocon::RegistrationCloud::Ptr unrelated(new robocon::RegistrationCloud);
++    for(int i=0;i<1500;++i){pcl::PointXYZI p;p.x=value(rng);p.y=value(rng);p.z=value(rng);p.intensity=0;unrelated->push_back(p);}
++    const auto false_loop=robocon::matchMappingCloud(source,unrelated,Eigen::Matrix4f::Identity(),.8,.01,.8,.7,1.,.35);
++    require(!false_loop.accepted&&false_loop.mse>.01&&false_loop.overlap>.9,
++      "Broad overlap alone accepted unrelated geometry");
++    std::cout<<"PASS timestamp brackets/rollback, registration, correction and full-scan quality gates\n";
++    return 0;
++  }catch(const std::exception &error){std::cerr<<error.what()<<'\n';return 1;}
++}
+--- /dev/null
++++ b/docs/mapping_consistency.md
+@@ -0,0 +1,104 @@
++# 建图漂移与回环检查
++
++`mapping.launch.py` 启动 `mode=map`。当前版本的建图链路为：
++
++```text
++FAST-LIO 局部扫描 + 同一时间的轮速/LIO 位姿
++    → 关键帧 → 局部子图 GICP → 鲁棒局部几何/轮速/LIO 约束
++    → Scan Context 历史候选 → 历史子图 GICP → 严格验证 + 连续关键帧确认
++    → iSAM2 更新历史位姿 → 重建 optimized_map → /save_map
++```
++
++保存地图定位的 BBS 参数不控制这条建图链路。
++
++## 为什么原来“有回环仍越建越歪”
++
++2026-11-02 的用户运行日志实际接受了 98 个回环。旧版用单历史扫描匹配，
++无空间候选约束、无修正幅度限制、无连续帧确认；MSE 门限 0.10 m²，
++且用 0.8 m 作为内点距离统计“重叠率”。因此日志中的 100% 重叠并不表示几厘米级对齐。
++0.08～0.10 m² 的匹配也被接受，可能把不准确的约束加入位姿图。
++日志旧单位写成 m，实际应为 m²；原 `getFitnessScore` 距离参数还混用了平方距离。
++仅凭截图无法逐个确认哪些约束为错误回环，但旧验收规则不足以防止这类破坏。
++
++另一处确定的问题是原关键帧把原始 `/livox/lidar` 与回调时最新的轮速/LIO 位姿拼在一起，
++没有按扫描时间配对。消息延迟、转弯和积压会造成点云与位姿不一致。
++当前改为 `/fast_lio/cloud_registered_body`，该扫描与 FAST-LIO 位姿共用时间戳；
++轮速使用时间插值，不跨越过大的测量间隔、不外推。该话题在当前零雷达/IMU外参配置下
++与局部雷达坐标一致。更换实际传感器外参时也需同步检查后端使用的安装变换。
++
++此外，旧版没有后端的局部扫描到子图约束，回环前主要依靠轮速与较弱的 LIO 相对因子。
++现在增加局部几何配准约束，回环检测仍负责历史漂移修正。
++
++## 如何运行与确认
++
++```bash
++cd /home/alice/rc_2027/cloud_localization
++source scripts/env.sh
++ros2 launch robocon_cloud_localization mapping.launch.py
++```
++
++重新启动后才使用新程序/参数。终端应出现：
++
++- `Mapping input=/fast_lio/cloud_registered_body`：确认新的建图输入。
++- `Mapping local GICP accepted/rejected`：局部几何约束是否通过。
++- `Loop ... pending: 1/2 consistent keyframes`：历史回环等待第二个关键帧确认。
++- `Accepted verified loop ... graph correction=...; rebuilding all keyframes`：
++  回环已写入图，并打印对当前位姿实际产生的修正。
++- `Rejected loop ... mse=... m^2 overlap=... correction=...`：未通过验收。
++- `Mapping scan rejected: no time-aligned wheel/LIO poses`：缺少有效时间配对，
++  应检查里程计时间戳/发布连续性，而非放宽回环误差。
++
++回环需要足够的历史间隔和相似、重叠的几何；经过原来的区域也不保证任何一帧立即通过。
++`/localization/optimized_map` 会随历史位姿更新，原始 FAST-LIO 地图不会被这条后端链路回写。
++启动时地图坐标锚定第一帧雷达，不是 Gazebo 的 world。
++
++## 建图参数
++
++位置：`src/robocon_cloud_localization/config/localization.yaml`，修改后重启。
++
++| 参数 | 当前值 | 含义 |
++|---|---:|---|
++| `mapping_sync_max_gap` | 0.20 s | 允许用于位姿插值的最大里程计时间间隔 |
++| `mapping_local_registration` | true | 是否添加局部扫描到子图几何约束 |
++| `mapping_local_submap_frames` | 5 | 局部子图最多使用最近几帧 |
++| `mapping_local_fitness_max` | 0.01 m² | 局部配准全点截断 MSE 上限 |
++| `mapping_local_inlier_ratio_min` | 0.70 | 局部配准最小重叠比例 |
++| `mapping_local_max_correction/max_rotation` | 0.30 m / 0.15 rad | 局部匹配相对轮速预测的最大修正 |
++| `loop_search_radius` | 2.5 m | 图预测位置附近的历史候选搜索范围 |
++| `loop_separation` | 12 帧 | 排除近期关键帧 |
++| `loop_min_time` | 15 s | 与历史候选的最小时间间隔 |
++| `loop_similarity` | 0.42 | Scan Context 差异上限，越小越严格 |
++| `loop_candidates` | 3 | 最多验证几个候选，避免只尝试一个错误候选 |
++| `loop_submap_frames` | 2 | 历史候选前后各加入几帧，排除近期帧 |
++| `gicp_max_correspondence` | 0.8 m | 寻找 GICP 对应点的半径 |
++| `loop_fitness_max` | 0.01 m² | 全点截断 MSE 上限，未匹配点计入误差 |
++| `loop_inlier_distance` | 0.20 m | 判定内点的半径，供回环和局部配准质量评估 |
++| `loop_inlier_ratio_min` | 0.70 | 历史回环最小内点比例 |
++| `loop_max_correction/max_rotation` | 1.0 m / 0.35 rad | 相对图预测允许的最大回环修正 |
++| `loop_consistent_frames` | 2 | 连续不同关键帧的确认数量 |
++| `loop_consistency_translation/rotation` | 0.20 m / 0.10 rad | 轮速补偿后候选位姿允许的差异 |
++| `loop_min_interval` | 3 s | 两次接受回环的最小间隔，避免反复加入同一处约束 |
++| `loop_ambiguity_ratio` | 1.25 | 不同位姿有接近的匹配误差时拒绝回环，增大更严格 |
++
++`keyframe_distance/yaw` 控制运动关键帧触发，`keyframe_min_interval` 控制频率，
++`keyframe_voxel` 控制扫描降采样。已有 YAML 中的 `keyframe_max_*` 尚未被节点声明/使用，
++添加这些键不会自行产生相应行为。
++
++当前空间搜索和修正上限针对有连续轮速的场地仿真。漂移远超这些界限时会拒绝回环，
++不能保证任意大的全局漂移恢复；重复/无特征平面也仍可能缺乏足够约束。
++
++## 保存与后续定位
++
++```bash
++./scripts/save_map.sh
++ros2 launch robocon_cloud_localization localization.launch.py \
++  map_file:=/home/alice/rc_2027/cloud_localization/maps/fastlio_mid360_downward/map.pcd
++```
++
++`/save_map` 保存的是优化后的地图及关键帧。FAST-LIO YAML 中的
++`pcd_save.pcd_save_path` 是另外一张前端累计地图，它不会包含后端回环修正。
++若只需要优化地图，可在建图 launch 命令上加 `save_fastlio_pcd:=false`。
++`map_directory:=/absolute/output/bundle` 可指定 `/save_map` 的输出目录。
++既有聚合 PCD 不会因为更新程序而自动消除重影，应重新建图，或使用保留的原始关键帧另做离线优化。
++
++验证结果、保留的运行日志和复现脚本见 `reports/mapping_consistency_20261102/`。

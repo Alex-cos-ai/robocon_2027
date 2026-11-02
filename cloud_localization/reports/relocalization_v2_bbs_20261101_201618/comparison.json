@@ -1,0 +1,362 @@
+[
+  {
+    "backend": "grid_gicp",
+    "run": 0,
+    "found": true,
+    "timed_out": false,
+    "map_build_ms": 0.0,
+    "search_ms": 31.798064,
+    "refine_ms": 275.175582,
+    "total_ms": 306.973646,
+    "coarse_score": 0.0,
+    "fitness_m2": 0.000847,
+    "overlap": 1.0,
+    "xyz": [
+      0.040144,
+      -0.030069,
+      0.449944
+    ],
+    "rpy": [
+      4e-05,
+      1.5e-05,
+      0.029976
+    ],
+    "case": "synthetic"
+  },
+  {
+    "backend": "bbs_cpu_gicp",
+    "run": 0,
+    "found": true,
+    "timed_out": false,
+    "map_build_ms": 0.493956,
+    "search_ms": 8.416511,
+    "refine_ms": 9.816194,
+    "total_ms": 18.726661,
+    "coarse_score": 1.0,
+    "fitness_m2": 0.000847,
+    "overlap": 1.0,
+    "xyz": [
+      0.040148,
+      -0.030057,
+      0.44995
+    ],
+    "rpy": [
+      3.5e-05,
+      1.5e-05,
+      0.029978
+    ],
+    "case": "synthetic"
+  },
+  {
+    "backend": "bbs_gpu_gicp",
+    "run": 0,
+    "found": true,
+    "timed_out": false,
+    "map_build_ms": 118.169558,
+    "search_ms": 5.080078,
+    "refine_ms": 7.843218,
+    "total_ms": 131.092854,
+    "coarse_score": 1.0,
+    "fitness_m2": 0.000847,
+    "overlap": 1.0,
+    "xyz": [
+      0.040148,
+      -0.030061,
+      0.449951
+    ],
+    "rpy": [
+      3.3e-05,
+      1.5e-05,
+      0.029976
+    ],
+    "case": "synthetic"
+  },
+  {
+    "backend": "grid_gicp",
+    "run": 0,
+    "found": false,
+    "timed_out": false,
+    "map_build_ms": 0.0,
+    "search_ms": 60.784641,
+    "refine_ms": 338.622777,
+    "total_ms": 399.407418,
+    "coarse_score": 0.0,
+    "fitness_m2": 0.0,
+    "overlap": 0.0,
+    "xyz": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "rpy": [
+      0.0,
+      -0.0,
+      0.0
+    ],
+    "case": "symmetric"
+  },
+  {
+    "backend": "bbs_cpu_gicp",
+    "run": 0,
+    "found": false,
+    "timed_out": false,
+    "map_build_ms": 1.165327,
+    "search_ms": 17.797422,
+    "refine_ms": 24.011921,
+    "total_ms": 42.97467,
+    "coarse_score": 1.0,
+    "fitness_m2": 0.0,
+    "overlap": 0.0,
+    "xyz": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "rpy": [
+      0.0,
+      -0.0,
+      0.0
+    ],
+    "case": "symmetric"
+  },
+  {
+    "backend": "bbs_gpu_gicp",
+    "run": 0,
+    "found": false,
+    "timed_out": false,
+    "map_build_ms": 115.869422,
+    "search_ms": 5.740093,
+    "refine_ms": 28.543426,
+    "total_ms": 150.152941,
+    "coarse_score": 1.0,
+    "fitness_m2": 0.0,
+    "overlap": 0.0,
+    "xyz": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "rpy": [
+      0.0,
+      -0.0,
+      0.0
+    ],
+    "case": "symmetric"
+  },
+  {
+    "backend": "grid_gicp",
+    "run": 0,
+    "found": true,
+    "timed_out": false,
+    "map_build_ms": 0.0,
+    "search_ms": 150.241887,
+    "refine_ms": 1071.447102,
+    "total_ms": 1221.688989,
+    "coarse_score": 0.0,
+    "fitness_m2": 0.001478,
+    "overlap": 1.0,
+    "xyz": [
+      -2.719873,
+      -2.572303,
+      0.614382
+    ],
+    "rpy": [
+      -0.00294,
+      0.003025,
+      -0.087066
+    ],
+    "case": "simulation"
+  },
+  {
+    "backend": "grid_gicp",
+    "run": 1,
+    "found": true,
+    "timed_out": false,
+    "map_build_ms": 0.0,
+    "search_ms": 144.174711,
+    "refine_ms": 1065.644184,
+    "total_ms": 1209.818895,
+    "coarse_score": 0.0,
+    "fitness_m2": 0.001478,
+    "overlap": 1.0,
+    "xyz": [
+      -2.719873,
+      -2.572303,
+      0.614382
+    ],
+    "rpy": [
+      -0.00294,
+      0.003025,
+      -0.087066
+    ],
+    "case": "simulation"
+  },
+  {
+    "backend": "grid_gicp",
+    "run": 2,
+    "found": true,
+    "timed_out": false,
+    "map_build_ms": 0.0,
+    "search_ms": 143.159922,
+    "refine_ms": 1066.850919,
+    "total_ms": 1210.010841,
+    "coarse_score": 0.0,
+    "fitness_m2": 0.001478,
+    "overlap": 1.0,
+    "xyz": [
+      -2.719873,
+      -2.572303,
+      0.614382
+    ],
+    "rpy": [
+      -0.00294,
+      0.003025,
+      -0.087066
+    ],
+    "case": "simulation"
+  },
+  {
+    "backend": "bbs_cpu_gicp",
+    "run": 0,
+    "found": true,
+    "timed_out": false,
+    "map_build_ms": 2.370964,
+    "search_ms": 346.857671,
+    "refine_ms": 27.158609,
+    "total_ms": 376.387244,
+    "coarse_score": 1.0,
+    "fitness_m2": 0.00148,
+    "overlap": 1.0,
+    "xyz": [
+      -2.716852,
+      -2.577197,
+      0.614585
+    ],
+    "rpy": [
+      -0.003033,
+      0.003026,
+      -0.086195
+    ],
+    "case": "simulation"
+  },
+  {
+    "backend": "bbs_cpu_gicp",
+    "run": 1,
+    "found": true,
+    "timed_out": false,
+    "map_build_ms": 0.0,
+    "search_ms": 339.549183,
+    "refine_ms": 26.690032,
+    "total_ms": 366.239215,
+    "coarse_score": 1.0,
+    "fitness_m2": 0.00148,
+    "overlap": 1.0,
+    "xyz": [
+      -2.716852,
+      -2.577197,
+      0.614585
+    ],
+    "rpy": [
+      -0.003033,
+      0.003026,
+      -0.086195
+    ],
+    "case": "simulation"
+  },
+  {
+    "backend": "bbs_cpu_gicp",
+    "run": 2,
+    "found": true,
+    "timed_out": false,
+    "map_build_ms": 0.0,
+    "search_ms": 338.718054,
+    "refine_ms": 35.106656,
+    "total_ms": 373.82471,
+    "coarse_score": 1.0,
+    "fitness_m2": 0.00148,
+    "overlap": 1.0,
+    "xyz": [
+      -2.716852,
+      -2.577197,
+      0.614585
+    ],
+    "rpy": [
+      -0.003033,
+      0.003026,
+      -0.086195
+    ],
+    "case": "simulation"
+  },
+  {
+    "backend": "bbs_gpu_gicp",
+    "run": 0,
+    "found": true,
+    "timed_out": false,
+    "map_build_ms": 150.56956,
+    "search_ms": 15.583996,
+    "refine_ms": 24.879971,
+    "total_ms": 191.033527,
+    "coarse_score": 1.0,
+    "fitness_m2": 0.001483,
+    "overlap": 1.0,
+    "xyz": [
+      -2.716114,
+      -2.578627,
+      0.614334
+    ],
+    "rpy": [
+      -0.003035,
+      0.003028,
+      -0.085897
+    ],
+    "case": "simulation"
+  },
+  {
+    "backend": "bbs_gpu_gicp",
+    "run": 1,
+    "found": true,
+    "timed_out": false,
+    "map_build_ms": 0.0,
+    "search_ms": 14.915141,
+    "refine_ms": 25.657158,
+    "total_ms": 40.572299,
+    "coarse_score": 1.0,
+    "fitness_m2": 0.001483,
+    "overlap": 1.0,
+    "xyz": [
+      -2.716114,
+      -2.578627,
+      0.614334
+    ],
+    "rpy": [
+      -0.003035,
+      0.003028,
+      -0.085897
+    ],
+    "case": "simulation"
+  },
+  {
+    "backend": "bbs_gpu_gicp",
+    "run": 2,
+    "found": true,
+    "timed_out": false,
+    "map_build_ms": 0.0,
+    "search_ms": 14.888815,
+    "refine_ms": 24.512707,
+    "total_ms": 39.401522,
+    "coarse_score": 1.0,
+    "fitness_m2": 0.001483,
+    "overlap": 1.0,
+    "xyz": [
+      -2.716114,
+      -2.578627,
+      0.614334
+    ],
+    "rpy": [
+      -0.003035,
+      0.003028,
+      -0.085897
+    ],
+    "case": "simulation"
+  }
+]

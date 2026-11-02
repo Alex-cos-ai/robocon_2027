@@ -1,0 +1,95 @@
+/**:
+  ros__parameters:
+    use_sim_time: true
+    mode: map
+    map_directory: "maps/fastlio_mid360_downward"
+    map_file: ""
+    localization_map_voxel: 0.10 # 加载地图时对地图点云做体素降采样的尺寸（米）
+
+    # 以下的判断都是或的条件，满足其中一个就会生成关键帧-------------
+    keyframe_distance: 0.55 # 累计平移超过该距离才会生成关键帧
+    keyframe_yaw: 0.28 # 累计旋转超过该角度才会生成关键帧
+    keyframe_max_yaw: 1.57 # 累计旋转超过该角度会强制生成关键帧
+    keyframe_min_interval: 0.50 # 关键帧之间的最小间隔时间，单位秒
+    keyframe_max_interval: 5.0 # 关键帧之间的最大间隔时间，单位秒
+    keyframe_max_distance: 2.0 # 累计平移超过该距离会强制生成关键帧
+    
+    keyframe_voxel: 0.10 # 关键帧体素降采样尺寸（米）
+    scan_context_rings: 20 # 扫描上下文的环数，增大提高径向分辨率，减小提高计算速度
+    scan_context_sectors: 60 # 扫描上下文的扇区数，角度分辨率
+    scan_context_radius: 18.0 # 扫描上下文的半径（m）MID360 的有效测距通常在 40–70 m
+    
+    loop_separation: 12 # 循环闭合的最小距离（当前关键帧只与至少 12 个关键帧之前的帧进行回环匹配）
+    loop_similarity: 0.42 # 循环闭合的相似度阈值，得分越低表示越相似
+    gicp_max_correspondence: 0.8 # GICP最大对应点距离
+    # 以下是配准后的验收门限，不是 GICP 数值迭代的收敛条件。
+    loop_fitness_max: 0.01 # 全点截断均方距离，m²，包括没有匹配上的点
+    loop_inlier_distance: 0.20 # 内点距离，m；独立于上面的 0.8 m 搜索对应距离
+    loop_inlier_ratio_min: 0.70
+    loop_search_radius: 2.5 # 图优化预测位置附近的历史候选，m
+    loop_min_time: 15.0 # 与历史候选间隔的最短秒数
+    loop_candidates: 3 # 最多尝试的 Scan Context 候选
+    loop_submap_frames: 2 # 历史候选前后各融合几帧，排除近期扫描
+    loop_max_correction: 1.0 # 相对图预测允许的最大修正，m
+    loop_max_rotation: 0.35 # rad
+    loop_consistent_frames: 2 # 不同关键帧连续验证通过才添加回环约束
+    loop_consistency_translation: 0.20 # 轮速补偿后候选位姿的一致性，m
+    loop_consistency_rotation: 0.10 # rad
+    loop_min_interval: 3.0 # 两个已接受回环约束之间的最短秒数
+    loop_ambiguity_ratio: 1.25 # 不同位置却有接近误差的候选，拒绝此次回环
+    # 建图改用 FAST-LIO 去畸变局部扫描，按扫描时间插值匹配里程计。
+    mapping_sync_max_gap: 0.20 # 允许插值的最大里程计间隔，s
+    mapping_local_registration: true # 回环前也进行局部扫描到子图配准
+    mapping_local_submap_frames: 5
+    mapping_local_fitness_max: 0.01 # 全点 MSE，m²
+    mapping_local_inlier_ratio_min: 0.70
+    mapping_local_max_correction: 0.30 # 单关键帧修正上限，m
+    mapping_local_max_rotation: 0.15 # rad
+
+    localization_fitness_max: 0.35  # PCL mean squared distance, m^2
+    localization_icp_weight: 0.10 
+    #0.10 意味着每次只将 GICP 建议校正量的 10% 应用到当前位姿上，其余保留给里程计预测
+
+    localization_max_correction: 0.35 # 启动时允许更大的初始校正量1m/0.35rad
+    localization_max_rotation_correction: 0.25
+    # Startup: accept a larger correction only after good scan overlap and
+    # consecutive candidates agree. Once aligned, use the strict gates above.
+    
+    localization_initial_max_correction: 1.0  # m
+    localization_initial_max_rotation_correction: 0.35  # rad
+    localization_initial_fitness_max: 0.01  # m^2 (0.10 m RMSE)
+    # 对应 0.10 m RMSE）：启动阶段反而要求更高的配准精度才接受校正
+    localization_initial_inlier_distance: 0.20  # m
+    localization_initial_inlier_ratio_min: 0.60
+
+    localization_initial_consistent_frames: 3
+    localization_initial_consistency_translation: 0.10  # m between candidates
+    localization_initial_consistency_rotation: 0.05  # rad between candidates
+    # 连续 3 帧的候选校正量之间，平移差异不超过 0.10 m、
+    # 旋转差异不超过 0.05 rad，才认为启动对齐成功。这是时序一致性检验，
+    # 过滤掉单帧偶然的“好匹配”
+    localization_global_enabled: true
+    # Shared input/output, GICP refinement and quality checks for A/B tests.
+    # grid_gicp: V1; bbs_cpu_gicp / bbs_gpu_gicp: official 3D-BBS V2.
+
+    localization_global_backend: bbs_gpu_gicp #对 BBS 给出的候选，再用 GICP 做精细配准
+    localization_global_failure_frames: 10 # 当局部 GICP 持续失败10帧
+    localization_global_retry_seconds: 5.0 # 重试间隔时间，秒
+    localization_global_voxel: 0.25  # （m）全局搜索时使用的粗分辨率体素地图尺寸
+    localization_global_xy_step: 0.50  # m 全局搜索的离散化步长
+    localization_global_z_step: 0.50  # m
+    localization_global_yaw_step: 0.2617993878  # 15 degrees, radians
+    localization_global_refine_candidates: 32 # 仅 V1 网格搜索；BBS 的近最佳候选集合最多 8 个
+    localization_global_ambiguity_ratio: 1.25  # reject similarly good distinct locations
+    
+    
+    localization_bbs_resolution: 0.20  # 最细层体素分辨率（米）
+    localization_bbs_levels: 5  # 层级数，每层分辨率翻倍，因此最粗层分辨率为 0.20 × 2⁵ = 6.4 m。
+    localization_bbs_scan_voxel: 0.25  
+    # 表示在送入 BBS 搜索之前，先对当前这帧查询点云做 0.25 m 的体素降采样
+    localization_bbs_roll_pitch_window: 0.035  # residual radians after tilt prealignment
+    localization_bbs_score_threshold: 0.60  # BBS 搜索的得分阈值（占用体素比例）
+    localization_bbs_timeout_ms: 3000  # search only; map setup/refinement measured separately
+    localization_bbs_cpu_threads: 2 #CPU 版本的线程数
+    localization_bbs_gpu_batch_size: 10000
+    map_publish_rate: 1.0

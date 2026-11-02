@@ -1,0 +1,34 @@
+/**:
+  ros__parameters:
+    use_sim_time: true
+    mode: map
+    map_directory: "maps/fastlio_mid360_downward"
+    map_file: ""
+    localization_map_voxel: 0.10
+    keyframe_distance: 0.55
+    keyframe_yaw: 0.28
+    keyframe_min_interval: 0.50
+    keyframe_voxel: 0.10
+    scan_context_rings: 20
+    scan_context_sectors: 60
+    scan_context_radius: 18.0
+    loop_separation: 12
+    loop_similarity: 0.42
+    gicp_max_correspondence: 0.8
+    loop_fitness_max: 0.10
+    loop_inlier_ratio_min: 0.35
+    localization_fitness_max: 0.35  # PCL mean squared distance, m^2
+    localization_icp_weight: 0.10
+    localization_max_correction: 0.35
+    localization_max_rotation_correction: 0.25
+    # Startup: accept a larger correction only after good scan overlap and
+    # consecutive candidates agree. Once aligned, use the strict gates above.
+    localization_initial_max_correction: 1.0  # m
+    localization_initial_max_rotation_correction: 0.35  # rad
+    localization_initial_fitness_max: 0.01  # m^2 (0.10 m RMSE)
+    localization_initial_inlier_distance: 0.20  # m
+    localization_initial_inlier_ratio_min: 0.60
+    localization_initial_consistent_frames: 3
+    localization_initial_consistency_translation: 0.10  # m between candidates
+    localization_initial_consistency_rotation: 0.05  # rad between candidates
+    map_publish_rate: 1.0

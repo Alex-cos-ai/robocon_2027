@@ -1,0 +1,13 @@
+frontend=FAST-LIO2 (IKFoM + ikd-Tree)
+mapping_cloud=/fast_lio/cloud_registered_body
+mapping_pose_sync=timestamp interpolation
+loop_detection=Scan Context
+loop_verification=historical submap GICP, all-point MSE, tight overlap, bounded innovation, consecutive keyframes
+pose_graph=GTSAM iSAM2, wheel-odometry factors plus robust FAST-LIO2 relative factors
+lidar_mount_translation_base_footprint=-0.10,0,0.46
+lidar_mount_rpy_base_footprint=3.1415926536,0,0
+keyframes=46
+local_registration_factors=36
+loop_closures=5
+points=11956
+frame=map, anchored at the initial lidar pose

@@ -1,0 +1,192 @@
+diff --git a/bbs3d/include/cpu_bbs3d/bbs3d.hpp b/bbs3d/include/cpu_bbs3d/bbs3d.hpp
+index bde9121..db57ba6 100644
+--- a/bbs3d/include/cpu_bbs3d/bbs3d.hpp
++++ b/bbs3d/include/cpu_bbs3d/bbs3d.hpp
+@@ -78,6 +78,10 @@ public:
+ 
+   bool has_localized() { return has_localized_; }
+ 
++  // Robocon extension: retain spatially distinct, near-best leaves for common
++  // GICP validation/ambiguity checks. Set ratio=1 for upstream best-score pruning.
++  void set_candidate_score_ratio(double ratio) {candidate_score_ratio_ = ratio;}
++  std::vector<Eigen::Matrix4d> get_candidate_poses() const {return candidate_poses_;}
+   void localize();
+ 
+   // pcd iof
+@@ -104,6 +108,8 @@ private:
+     const std::vector<Eigen::Vector3d>& points);
+ 
+ private:
++  double candidate_score_ratio_ = 0.95;
++  std::vector<Eigen::Matrix4d> candidate_poses_;
+   Eigen::Matrix4d global_pose_;
+   bool has_timed_out_, has_localized_;
+   double elapsed_time_;
+diff --git a/bbs3d/include/gpu_bbs3d/bbs3d.cuh b/bbs3d/include/gpu_bbs3d/bbs3d.cuh
+index f07f24d..98e4323 100644
+--- a/bbs3d/include/gpu_bbs3d/bbs3d.cuh
++++ b/bbs3d/include/gpu_bbs3d/bbs3d.cuh
+@@ -82,6 +82,10 @@ public:
+ 
+   bool has_localized() { return has_localized_; }
+ 
++  // Robocon extension: retain spatially distinct, near-best leaves for common
++  // GICP validation/ambiguity checks. Set ratio=1 for upstream best-score pruning.
++  void set_candidate_score_ratio(double ratio) {candidate_score_ratio_ = ratio;}
++  std::vector<Eigen::Matrix4f> get_candidate_poses() const {return candidate_poses_;}
+   void localize();
+ 
+ private:
+@@ -99,6 +103,8 @@ private:
+   std::vector<std::vector<Eigen::Vector4i>> set_multi_buckets(const std::string& voxelmaps_folder_path);
+ 
+ private:
++  double candidate_score_ratio_ = 0.95;
++  std::vector<Eigen::Matrix4f> candidate_poses_;
+   Eigen::Matrix4f global_pose_;
+   bool has_timed_out_, has_localized_;
+   double elapsed_time_;
+diff --git a/bbs3d/src/cpu_bbs3d/bbs3d.cpp b/bbs3d/src/cpu_bbs3d/bbs3d.cpp
+index 12cc5f9..28f3f90 100644
+--- a/bbs3d/src/cpu_bbs3d/bbs3d.cpp
++++ b/bbs3d/src/cpu_bbs3d/bbs3d.cpp
+@@ -174,9 +174,14 @@ void BBS3D::localize() {
+   has_timed_out_ = false;
+ 
+   best_score_ = 0;
++  candidate_poses_.clear();
++  std::vector<std::pair<int, Eigen::Matrix4d>> candidates;
++
+   const int score_threshold = std::floor(src_points_.size() * score_threshold_percentage_);
+   int best_score = score_threshold;
+   DiscreteTransformation<double> best_trans(best_score);
++  const auto prune_score = [&]() {return std::max(score_threshold,
++    static_cast<int>(std::floor(best_score * candidate_score_ratio_)));};
+ 
+   // Preapre initial transset
+   const int max_bucket_scan_count = voxelmaps_ptr_->get_max_bucket_scan_count();
+@@ -207,13 +212,27 @@ void BBS3D::localize() {
+     trans_queue.pop();
+ 
+     // pruning
+-    if (trans.score < best_score) {
++    if (trans.score < prune_score()) {
+       continue;
+     }
+ 
+     if (trans.is_leaf()) {
+-      best_trans = trans;
+-      best_score = trans.score;
++      if (trans.score >= best_score) {best_trans = trans; best_score = trans.score;}
++      const Eigen::Matrix4d pose=trans.create_matrix(voxelmaps_ptr_->get_min_res(),
++        ang_info_vec[0].rpy_res, ang_info_vec[0].min_rpy);
++      bool duplicate=false;
++      for(auto &candidate:candidates) {
++        const double angle=std::remainder(std::atan2(pose(1,0),pose(0,0))-
++          std::atan2(candidate.second(1,0),candidate.second(0,0)),2*M_PI);
++        if((pose.template block<3,1>(0,3)-candidate.second.template block<3,1>(0,3)).norm()<=0.75 &&
++            std::abs(angle)<=0.35) {
++          if(trans.score>candidate.first)candidate={trans.score,pose};
++          duplicate=true;break;
++        }
++      }
++      if(!duplicate)candidates.emplace_back(trans.score,pose);
++      std::sort(candidates.begin(),candidates.end(),[](const auto &a,const auto &b) {return a.first>b.first;});
++      if(candidates.size()>8)candidates.resize(8);
+     } else {
+       const int child_level = trans.level - 1;
+       const Eigen::Vector3i& num_division = ang_info_vec[child_level].num_division;
+@@ -231,7 +250,7 @@ void BBS3D::localize() {
+ 
+       for (const auto& child : children) {
+         // pruning
+-        if (child.score < best_score) {
++        if (child.score < prune_score()) {
+           continue;
+         }
+ 
+@@ -253,6 +272,8 @@ void BBS3D::localize() {
+   double min_res = voxelmaps_ptr_->get_min_res();
+   global_pose_ = best_trans.create_matrix(min_res, ang_info_vec[0].rpy_res, ang_info_vec[0].min_rpy);
+   best_score_ = best_score;
++  for(const auto &candidate:candidates)
++    if(candidate.first>=prune_score())candidate_poses_.push_back(candidate.second);
+   has_timed_out_ = false;
+   has_localized_ = true;
+ }
+diff --git a/bbs3d/src/gpu_bbs3d/bbs3d.cu b/bbs3d/src/gpu_bbs3d/bbs3d.cu
+index 421c77c..967ff80 100644
+--- a/bbs3d/src/gpu_bbs3d/bbs3d.cu
++++ b/bbs3d/src/gpu_bbs3d/bbs3d.cu
+@@ -155,9 +155,14 @@ void BBS3D::localize() {
+ 
+   // Initialize best score
+   best_score_ = 0;
++  candidate_poses_.clear();
++  std::vector<std::pair<int, Eigen::Matrix4f>> candidates;
++
+   const int score_threshold = std::floor(src_points_.size() * score_threshold_percentage_);
+   int best_score = score_threshold;
+   DiscreteTransformation<float> best_trans(best_score);
++  const auto prune_score = [&]() {return std::max(score_threshold,
++    static_cast<int>(std::floor(best_score * candidate_score_ratio_)));};
+ 
+   // Preapre initial transset
+   const int max_level = voxelmaps_ptr_->get_max_level();
+@@ -193,20 +198,34 @@ void BBS3D::localize() {
+     if (trans_queue.empty() && !branch_stock.empty()) {
+       const auto transset_output = calc_scores(branch_stock, d_ang_info_vec);
+       for (const auto& output : transset_output) {
+-        if (output.score < best_score) continue;  // pruning
++        if (output.score < prune_score()) continue;  // pruning
+         trans_queue.push(output);
+       }
+       branch_stock.clear();
+     }
+ 
+     // pruning
+-    if (trans.score < best_score) {
++    if (trans.score < prune_score()) {
+       continue;
+     }
+ 
+     if (trans.is_leaf()) {
+-      best_trans = trans;
+-      best_score = trans.score;
++      if (trans.score >= best_score) {best_trans = trans; best_score = trans.score;}
++      const Eigen::Matrix4f pose=trans.create_matrix(voxelmaps_ptr_->get_min_res(),
++        ang_info_vec[0].rpy_res, ang_info_vec[0].min_rpy);
++      bool duplicate=false;
++      for(auto &candidate:candidates) {
++        const double angle=std::remainder(std::atan2(pose(1,0),pose(0,0))-
++          std::atan2(candidate.second(1,0),candidate.second(0,0)),2*M_PI);
++        if((pose.template block<3,1>(0,3)-candidate.second.template block<3,1>(0,3)).norm()<=0.75 &&
++            std::abs(angle)<=0.35) {
++          if(trans.score>candidate.first)candidate={trans.score,pose};
++          duplicate=true;break;
++        }
++      }
++      if(!duplicate)candidates.emplace_back(trans.score,pose);
++      std::sort(candidates.begin(),candidates.end(),[](const auto &a,const auto &b) {return a.first>b.first;});
++      if(candidates.size()>8)candidates.resize(8);
+     } else {
+       const int child_level = trans.level - 1;
+       trans.branch(branch_stock, child_level, static_cast<int>(v_rate_), ang_info_vec[child_level].num_division);
+@@ -215,7 +234,7 @@ void BBS3D::localize() {
+     if (branch_stock.size() >= branch_copy_size_) {
+       const auto transset_output = calc_scores(branch_stock, d_ang_info_vec);
+       for (const auto& output : transset_output) {
+-        if (output.score < best_score) continue;  // pruning
++        if (output.score < prune_score()) continue;  // pruning
+         trans_queue.push(output);
+       }
+       branch_stock.clear();
+@@ -235,6 +254,8 @@ void BBS3D::localize() {
+   float min_res = voxelmaps_ptr_->get_min_res();
+   global_pose_ = best_trans.create_matrix(min_res, ang_info_vec[0].rpy_res, ang_info_vec[0].min_rpy);
+   best_score_ = best_score;
++  for(const auto &candidate:candidates)
++    if(candidate.first>=prune_score())candidate_poses_.push_back(candidate.second);
+   has_timed_out_ = false;
+   has_localized_ = true;
+ }
