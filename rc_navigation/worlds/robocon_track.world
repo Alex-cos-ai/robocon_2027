@@ -1,6 +1,14 @@
 <?xml version="1.0"?>
 <sdf version="1.6">
   <world name="robocon_world">
+    <!-- Fixed overview from behind the default start corner toward center. -->
+    <gui fullscreen="0">
+      <camera name="user_camera">
+        <pose>-11 11 11 0 0.6154797087 -0.7853981634</pose>
+        <view_controller>orbit</view_controller>
+        <projection_type>perspective</projection_type>
+      </camera>
+    </gui>
     <light type="directional" name="sun">
       <cast_shadows>true</cast_shadows>
       <pose>0 0 10 0 0 0</pose>

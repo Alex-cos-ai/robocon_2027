@@ -1,0 +1,16 @@
+Stock Waffle restoration verification, 2026-11-02
+Source: /opt/ros/humble/share/turtlebot3_gazebo
+Copied model.sdf, model.config, alternate SDF and shared meshes are byte-identical to the installed originals.
+URDF differs only in mesh package URI prefix.
+All SDF and URDF mesh paths resolve to bundled local assets.
+colcon build --packages-select rc_navigation: passed.
+Launch argument expansion: passed.
+Isolated Gazebo test: ROS_DOMAIN_ID=70, GAZEBO_MASTER_URI=http://127.0.0.1:11360.
+Runtime observation over approximately 12 seconds:
+  /scan: 60 messages, base_scan, 360 samples, range 0.12 to 3.5 m.
+  /odom: 352 messages.
+  /imu: 2383 messages.
+  /camera/image_raw: 117 messages, 1920 x 1080, rgb8.
+  base_footprint -> base_scan TF translation: (-0.064, 0, 0.132) m.
+Gazebo GUI close-up: chassis, wheels and LDS visual mesh present (see gazebo_waffle.png).
+This verifies model restoration and sensor/TF integration, not navigation accuracy with the existing map.

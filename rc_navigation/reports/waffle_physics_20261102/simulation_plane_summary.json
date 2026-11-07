@@ -1,0 +1,23 @@
+{
+  "label": "simulation_plane",
+  "samples_after_settle": 589,
+  "sim_duration": 19.991999999999997,
+  "command_count": 0,
+  "nonzero_command_count": 0,
+  "cmd_publishers": [],
+  "position_peak_to_peak_mm": [
+    0.5887560852899654,
+    0.0007083913997618652,
+    0.026532729492800486
+  ],
+  "roll_pitch_yaw_peak_to_peak_deg": [
+    0.002818082253285866,
+    0.0010147699110529885,
+    0.06284449248767135
+  ],
+  "planar_start_to_end_mm": 0.5887562853711926,
+  "max_abs_vx_wz": [
+    3.6187639689421094e-05,
+    5.0025541583682424e-05
+  ]
+}

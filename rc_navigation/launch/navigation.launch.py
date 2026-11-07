@@ -1,4 +1,4 @@
-"""Launch the Robocon field simulation and the 2-D Nav2 stack.
+"""Launch the Robocon field, stock TurtleBot3 Waffle and the 2-D Nav2 stack.
 
 The robot model publishes ``/scan`` from a planar Gazebo ray sensor and
 ``/odom`` from the differential-drive plugin.  AMCL is used by default for
@@ -35,15 +35,18 @@ def generate_launch_description():
     nav2_bringup_share = Path(get_package_share_directory("nav2_bringup"))
 
     default_world = share / "worlds" / "robocon_track.world"
-    default_robot_xacro = share / "urdf" / "robot_2d.xacro"
+    default_robot_xacro = share / "urdf" / "turtlebot3_waffle.urdf"
+    default_robot_sdf = share / "models" / "turtlebot3_waffle" / "model.sdf"
     default_params = share / "config" / "nav2_params.yaml"
-    default_map = share / "maps" / "robocon_track.yaml"
+    default_map = share / "maps" / "map_1.yaml"
     default_rviz = share / "rviz" / "nav2.rviz"
     model_path = share / "models"
 
     gui = LaunchConfiguration("gui")
     world = LaunchConfiguration("world")
     robot_xacro = LaunchConfiguration("robot_xacro")
+    robot_sdf = LaunchConfiguration("robot_sdf")
+    spawn_z = LaunchConfiguration("spawn_z")
     params_file = LaunchConfiguration("params_file")
     map_file = LaunchConfiguration("map")
     use_sim_time = LaunchConfiguration("use_sim_time")
@@ -110,15 +113,15 @@ def generate_launch_description():
         name="spawn_robocon_waffle",
         arguments=[
             "-entity",
-            "robocon_waffle_2d",
-            "-topic",
-            "robot_description",
+            "turtlebot3_waffle",
+            "-file",
+            robot_sdf,
             "-x",
             initial_pose_x,
             "-y",
             initial_pose_y,
             "-z",
-            "0.05",
+            spawn_z,
             "-Y",
             initial_pose_yaw,
         ],
@@ -183,7 +186,17 @@ def generate_launch_description():
             DeclareLaunchArgument(
                 "robot_xacro",
                 default_value=str(default_robot_xacro),
-                description="2-D differential-drive robot xacro.",
+                description="Matching Waffle URDF/xacro for robot_state_publisher.",
+            ),
+            DeclareLaunchArgument(
+                "robot_sdf",
+                default_value=str(default_robot_sdf),
+                description="Complete stock Waffle Gazebo SDF model.",
+            ),
+            DeclareLaunchArgument(
+                "spawn_z",
+                default_value="0.01",
+                description="Gazebo spawn height, matching the stock Waffle launcher.",
             ),
             DeclareLaunchArgument(
                 "params_file",

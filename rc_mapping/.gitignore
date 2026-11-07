@@ -1,0 +1,11 @@
+build/
+install/
+log/
+__pycache__/
+*.pyc
+maps/*
+!maps/.gitkeep
+src/fast_lio/Log/*
+!src/fast_lio/Log/.gitkeep
+src/fast_lio/PCD/*
+!src/fast_lio/PCD/.gitkeep

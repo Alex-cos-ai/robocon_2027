@@ -1,0 +1,22 @@
+<?xml version="1.0"?>
+<robot name="rc_mapping">
+  <link name="base_link"/>
+  <link name="footprint_link"/>
+  <link name="imu_link"/>
+  <link name="livox_frame"/>
+  <joint name="base_to_footprint_link" type="fixed">
+    <origin rpy="0 0 0" xyz="-0.195 0.183 0"/>
+    <parent link="base_link"/>
+    <child link="footprint_link"/>
+  </joint>
+  <joint name="base_to_imu" type="fixed">
+    <origin rpy="0 0 0" xyz="0 0 0"/>
+    <parent link="base_link"/>
+    <child link="imu_link"/>
+  </joint>
+  <joint name="imu_to_livox" type="fixed">
+    <origin rpy="0 0 0" xyz="-0.011 -0.02329 0.04412"/>
+    <parent link="imu_link"/>
+    <child link="livox_frame"/>
+  </joint>
+</robot>
